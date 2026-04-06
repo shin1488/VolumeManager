@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(./gradlew compileKotlinJvm)",
+      "Read(//c/Program Files/**)",
+      "Read(//c/Users/Shin/.jdks/**)",
+      "Bash(where java:*)",
+      "Bash(JAVA_HOME=\"C:/Users/Shin/.jdks/corretto-17.0.18\" ./gradlew compileKotlinJvm)",
+      "Bash(JAVA_HOME=\"C:/Users/Shin/.jdks/corretto-17.0.18\" ./gradlew run)",
+      "Bash(find /c/Users/Shin/IdeaProjects/VolumeManager -name *.env -o -name *.properties -o -name local.properties -o -name *.key -o -name *.keystore)"
+    ]
+  }
+}
