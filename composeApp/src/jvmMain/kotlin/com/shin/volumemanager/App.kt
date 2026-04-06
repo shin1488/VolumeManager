@@ -86,6 +86,7 @@ fun App(
     var showPanel by remember { mutableStateOf(false) }
     var opacity by remember { mutableStateOf(0.95f) }
     var panelOnLeft by remember { mutableStateOf(false) }
+    var isPanelExpanded by remember { mutableStateOf(false) }
     val screen = remember { GraphicsEnvironment.getLocalGraphicsEnvironment().maximumWindowBounds }
     val density = androidx.compose.ui.platform.LocalDensity.current
 
@@ -136,20 +137,26 @@ fun App(
     val panelShiftW = PANEL_W + PANEL_GAP + 4.dp
     LaunchedEffect(panelContent) {
         if (panelContent != null) {
-            val pos = windowState.position
-            if (pos is WindowPosition.Absolute) {
-                val windowCenterX = pos.x.value + windowState.size.width.value / 2f
-                val screenCenterX = screen.x + screen.width / 2f
-                panelOnLeft = windowCenterX > screenCenterX
-            } else {
-                panelOnLeft = false
+            // Only compute side and shift when going from closed → open.
+            // If already expanded (e.g. switching sessions), skip — otherwise
+            // the window shifts left again on every session switch.
+            if (!isPanelExpanded) {
+                val pos = windowState.position
+                if (pos is WindowPosition.Absolute) {
+                    val windowCenterX = pos.x.value + windowState.size.width.value / 2f
+                    val screenCenterX = screen.x + screen.width / 2f
+                    panelOnLeft = windowCenterX > screenCenterX
+                } else {
+                    panelOnLeft = false
+                }
+                if (panelOnLeft) {
+                    val pos2 = windowState.position
+                    if (pos2 is WindowPosition.Absolute)
+                        windowState.position = WindowPosition(pos2.x - panelShiftW, pos2.y)
+                }
+                windowState.size = DpSize(EXPANDED_W, windowState.size.height)
+                isPanelExpanded = true
             }
-            if (panelOnLeft) {
-                val pos2 = windowState.position
-                if (pos2 is WindowPosition.Absolute)
-                    windowState.position = WindowPosition(pos2.x - panelShiftW, pos2.y)
-            }
-            windowState.size = DpSize(EXPANDED_W, windowState.size.height)
             showPanel = true
         } else {
             showPanel = false
@@ -161,6 +168,7 @@ fun App(
             }
             windowState.size = DpSize(COLLAPSED_W, windowState.size.height)
             panelOnLeft = false
+            isPanelExpanded = false
         }
     }
 
