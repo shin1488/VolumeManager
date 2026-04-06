@@ -54,8 +54,8 @@ private val PANEL_GAP = 8.dp
 private val EXPANDED_W = COLLAPSED_W + PANEL_GAP + PANEL_W + 4.dp
 
 private val ICON_BOX = 40.dp
-private val ICON_IMG = 26.dp
-private val ICON_DEF = 20.dp
+private val ICON_IMG = 22.dp
+private val ICON_DEF = 22.dp
 
 // Y positions within the window Box
 // Surface padding 4dp · Column top padding 6dp · Pin 40dp · Opacity 40dp · Divider 5dp
@@ -193,15 +193,22 @@ fun App(
                     horizontalAlignment = Alignment.CenterHorizontally
                 ) {
                     // Pin button
-                    IconButton(
-                        onClick = { onAlwaysOnTopChange(!isAlwaysOnTop) },
-                        modifier = Modifier.size(ICON_BOX)
+                    Box(
+                        modifier = Modifier
+                            .size(ICON_BOX)
+                            .clip(CircleShape)
+                            .background(
+                                if (isAlwaysOnTop) MaterialTheme.colorScheme.primary.copy(0.15f)
+                                else Color.Transparent
+                            )
+                            .clickable { onAlwaysOnTopChange(!isAlwaysOnTop) },
+                        contentAlignment = Alignment.Center
                     ) {
                         Icon(
                             Icons.Default.PushPin, "Always on top",
                             tint = if (isAlwaysOnTop) MaterialTheme.colorScheme.primary
                             else MaterialTheme.colorScheme.onSurfaceVariant,
-                            modifier = Modifier.size(16.dp)
+                            modifier = Modifier.size(ICON_DEF)
                         )
                     }
 
@@ -252,9 +259,15 @@ fun App(
                     Spacer(Modifier.weight(1f))
 
                     // Close button
-                    IconButton(onClick = onClose, modifier = Modifier.size(ICON_BOX)) {
+                    Box(
+                        modifier = Modifier
+                            .size(ICON_BOX)
+                            .clip(CircleShape)
+                            .clickable { onClose() },
+                        contentAlignment = Alignment.Center
+                    ) {
                         Icon(
-                            Icons.Default.Close, "Close", Modifier.size(20.dp),
+                            Icons.Default.Close, "Close", Modifier.size(ICON_DEF),
                             tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f)
                         )
                     }
