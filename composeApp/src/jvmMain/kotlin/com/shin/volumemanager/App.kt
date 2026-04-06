@@ -267,7 +267,7 @@ fun App(
                         contentAlignment = Alignment.Center
                     ) {
                         Icon(
-                            Icons.Default.Close, "Close", Modifier.size(ICON_DEF),
+                            Icons.Default.Close, "Close", Modifier.size(28.dp),
                             tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f)
                         )
                     }
