@@ -5,9 +5,11 @@ import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.*
 import androidx.compose.material.icons.filled.*
@@ -16,16 +18,32 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.input.key.Key
+import androidx.compose.ui.input.key.KeyEventType
+import androidx.compose.ui.input.key.key
+import androidx.compose.ui.input.key.onKeyEvent
+import androidx.compose.ui.input.key.type
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.text.TextRange
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.DpSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.window.WindowPosition
 import androidx.compose.ui.window.WindowState
 import com.shin.volumemanager.audio.AudioManager
+import java.awt.GraphicsEnvironment
 import com.shin.volumemanager.model.AudioSession
 
 private const val ANIM_MS = 120
@@ -67,21 +85,82 @@ fun App(
     var panelContent by remember { mutableStateOf<PanelContent?>(null) }
     var showPanel by remember { mutableStateOf(false) }
     var opacity by remember { mutableStateOf(0.95f) }
+    var panelOnLeft by remember { mutableStateOf(false) }
+    val screen = remember { GraphicsEnvironment.getLocalGraphicsEnvironment().maximumWindowBounds }
+    val density = androidx.compose.ui.platform.LocalDensity.current
+
+    // Snap to screen corner while dragging near a corner (immediate, during drag)
+    // All math is done in physical pixels to avoid DPI-scaling mismatches.
+    LaunchedEffect(Unit) {
+        snapshotFlow { Triple(windowState.position, windowState.size, panelContent) }
+            .collect { (pos, size, content) ->
+                if (content != null || pos !is WindowPosition.Absolute) return@collect
+                val scale = density.density
+                // Convert dp → physical pixels
+                val x = (pos.x.value * scale).toInt()
+                val y = (pos.y.value * scale).toInt()
+                val w = (size.width.value * scale).toInt()
+                val h = (size.height.value * scale).toInt()
+                // Threshold = half the window width (≈30px at 100% on this app)
+                val threshold = (w / 2).coerceAtMost((20 * scale).toInt())
+                val nearLeft   = x - screen.x          < threshold
+                val nearRight  = (screen.x + screen.width)  - (x + w) < threshold
+                val nearTop    = y - screen.y           < threshold
+                val nearBottom = (screen.y + screen.height) - (y + h) < threshold
+                if ((nearLeft || nearRight) && (nearTop || nearBottom)) {
+                    val snapXpx = if (nearLeft) screen.x else screen.x + screen.width - w
+                    val snapYpx = if (nearTop)  screen.y else screen.y + screen.height - h
+                    if (x != snapXpx || y != snapYpx)
+                        windowState.position = WindowPosition(
+                            (snapXpx / scale).dp,
+                            (snapYpx / scale).dp
+                        )
+                }
+            }
+    }
 
     // Adjust height when session count changes
     LaunchedEffect(sessions.size) {
         windowState.size = DpSize(windowState.size.width, windowHeight(sessions.size))
     }
 
-    // Expand/collapse window width when panel opens/closes
+    // Close panel when the selected session exits
+    LaunchedEffect(sessions) {
+        val c = panelContent
+        if (c is PanelContent.VolumeSession && sessions.none { it.pid == c.pid }) {
+            panelContent = null
+        }
+    }
+
+    // Expand/collapse window width; shift left when window is on the right side of the screen
+    val panelShiftW = PANEL_W + PANEL_GAP + 4.dp
     LaunchedEffect(panelContent) {
         if (panelContent != null) {
+            val pos = windowState.position
+            if (pos is WindowPosition.Absolute) {
+                val windowCenterX = pos.x.value + windowState.size.width.value / 2f
+                val screenCenterX = screen.x + screen.width / 2f
+                panelOnLeft = windowCenterX > screenCenterX
+            } else {
+                panelOnLeft = false
+            }
+            if (panelOnLeft) {
+                val pos2 = windowState.position
+                if (pos2 is WindowPosition.Absolute)
+                    windowState.position = WindowPosition(pos2.x - panelShiftW, pos2.y)
+            }
             windowState.size = DpSize(EXPANDED_W, windowState.size.height)
             showPanel = true
         } else {
             showPanel = false
             kotlinx.coroutines.delay(ANIM_MS.toLong() + 30)
+            if (panelOnLeft) {
+                val pos = windowState.position
+                if (pos is WindowPosition.Absolute)
+                    windowState.position = WindowPosition(pos.x + panelShiftW, pos.y)
+            }
             windowState.size = DpSize(COLLAPSED_W, windowState.size.height)
+            panelOnLeft = false
         }
     }
 
@@ -98,9 +177,13 @@ fun App(
     MaterialTheme(colorScheme = darkColorScheme()) {
         Box(Modifier.fillMaxSize().graphicsLayer(alpha = opacity)) {
 
-            // ── LEFT: icon column ──────────────────────────────────
+            // ── Icon column (left normally, right when panel is on left) ──
             Surface(
-                modifier = Modifier.width(COLLAPSED_W).fillMaxHeight().padding(4.dp),
+                modifier = Modifier
+                    .width(COLLAPSED_W)
+                    .fillMaxHeight()
+                    .padding(4.dp)
+                    .align(if (panelOnLeft) Alignment.TopEnd else Alignment.TopStart),
                 shape = RoundedCornerShape(12.dp),
                 color = MaterialTheme.colorScheme.surface,
                 tonalElevation = 4.dp
@@ -171,22 +254,22 @@ fun App(
                     // Close button
                     IconButton(onClick = onClose, modifier = Modifier.size(ICON_BOX)) {
                         Icon(
-                            Icons.Default.Close, "Close", Modifier.size(13.dp),
-                            tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f)
+                            Icons.Default.Close, "Close", Modifier.size(20.dp),
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f)
                         )
                     }
                 }
             }
 
-            // ── RIGHT: compact floating panel aligned to the icon ──
+            // ── Compact floating panel (right normally, left when panelOnLeft) ──
             AnimatedVisibility(
                 visible = showPanel,
                 modifier = Modifier
-                    .offset(x = COLLAPSED_W + PANEL_GAP, y = panelY)
+                    .offset(x = if (panelOnLeft) 4.dp else COLLAPSED_W + PANEL_GAP, y = panelY)
                     .width(PANEL_W)
                     .height(PANEL_H),
-                enter = expandHorizontally(tween(ANIM_MS), Alignment.Start) + fadeIn(tween(ANIM_MS)),
-                exit = shrinkHorizontally(tween(ANIM_MS), Alignment.Start) + fadeOut(tween(ANIM_MS))
+                enter = expandHorizontally(tween(ANIM_MS), if (panelOnLeft) Alignment.End else Alignment.Start) + fadeIn(tween(ANIM_MS)),
+                exit = shrinkHorizontally(tween(ANIM_MS), if (panelOnLeft) Alignment.End else Alignment.Start) + fadeOut(tween(ANIM_MS))
             ) {
                 Surface(
                     modifier = Modifier.fillMaxSize(),
@@ -286,10 +369,39 @@ private fun CompactVolumePanel(
 ) {
     var localVolume by remember(session.pid) { mutableStateOf(session.volume) }
     var isDragging by remember { mutableStateOf(false) }
+    var isEditing by remember(session.pid) { mutableStateOf(false) }
+    var hasFocus by remember(session.pid) { mutableStateOf(false) }
+    var inputValue by remember(session.pid) { mutableStateOf(TextFieldValue("")) }
+    val focusRequester = remember(session.pid) { FocusRequester() }
 
     LaunchedEffect(session.volume) {
         if (!isDragging) localVolume = session.volume
     }
+
+    LaunchedEffect(isEditing) {
+        if (isEditing) {
+            hasFocus = false
+            val text = "${(localVolume * 100).toInt()}"
+            inputValue = TextFieldValue(text, selection = TextRange(0, text.length))
+            kotlinx.coroutines.delay(50)
+            runCatching { focusRequester.requestFocus() }
+        }
+    }
+
+    fun commitInput() {
+        val v = inputValue.text.toIntOrNull()?.coerceIn(0, 100)
+        if (v != null) {
+            localVolume = v / 100f
+            onVolumeChange(v / 100f)
+        }
+        isEditing = false
+        hasFocus = false
+    }
+
+    val activeColor = if (session.isMuted)
+        MaterialTheme.colorScheme.onSurface.copy(alpha = 0.2f)
+    else MaterialTheme.colorScheme.primary
+    val inactiveColor = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.12f)
 
     Row(
         modifier = Modifier.fillMaxSize().padding(horizontal = 8.dp),
@@ -311,31 +423,80 @@ private fun CompactVolumePanel(
 
         Spacer(Modifier.width(4.dp))
 
-        // Volume % — wide enough for "100%"
+        // Process name
         Text(
-            "${(localVolume * 100).toInt()}%",
+            session.displayName,
             fontSize = 10.sp,
             color = MaterialTheme.colorScheme.onSurface.copy(
-                alpha = if (session.isMuted) 0.4f else 1f
+                alpha = if (session.isMuted) 0.4f else 0.75f
             ),
-            textAlign = TextAlign.End,
             maxLines = 1,
-            modifier = Modifier.width(34.dp)
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.width(46.dp)
         )
 
         Spacer(Modifier.width(4.dp))
 
-        // Slider with uniform track shape
-        val activeColor = if (session.isMuted)
-            MaterialTheme.colorScheme.onSurface.copy(alpha = 0.2f)
-        else MaterialTheme.colorScheme.primary
-        val inactiveColor = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.12f)
+        // Volume % (tappable) ↔ inline input
+        if (isEditing) {
+            BasicTextField(
+                value = inputValue,
+                onValueChange = {
+                    inputValue = it.copy(text = it.text.filter(Char::isDigit).take(3))
+                },
+                modifier = Modifier
+                    .width(34.dp)
+                    .focusRequester(focusRequester)
+                    .onFocusChanged {
+                        if (it.isFocused) hasFocus = true
+                        else if (hasFocus) commitInput()
+                    }
+                    .onKeyEvent { event ->
+                        when {
+                            event.key == Key.Enter || event.key == Key.NumPadEnter -> {
+                                if (event.type == KeyEventType.KeyUp) commitInput()
+                                true
+                            }
+                            event.type == KeyEventType.KeyDown && event.key == Key.Escape -> {
+                                isEditing = false; hasFocus = false; true
+                            }
+                            else -> false
+                        }
+                    },
+                textStyle = TextStyle(
+                    fontSize = 10.sp,
+                    color = MaterialTheme.colorScheme.primary,
+                    textAlign = TextAlign.End
+                ),
+                singleLine = true,
+                cursorBrush = SolidColor(MaterialTheme.colorScheme.primary)
+            )
+        } else {
+            Text(
+                "${(localVolume * 100).toInt()}%",
+                fontSize = 10.sp,
+                color = MaterialTheme.colorScheme.onSurface.copy(
+                    alpha = if (session.isMuted) 0.4f else 1f
+                ),
+                textAlign = TextAlign.End,
+                maxLines = 1,
+                modifier = Modifier
+                    .width(34.dp)
+                    .pointerInput(session.isMuted) {
+                        detectTapGestures { if (!session.isMuted) isEditing = true }
+                    }
+            )
+        }
 
+        Spacer(Modifier.width(4.dp))
+
+        // Slider
         Slider(
             value = localVolume,
             onValueChange = {
                 localVolume = it
                 isDragging = true
+                isEditing = false
                 onVolumeChange(it)
             },
             onValueChangeFinished = { isDragging = false },
@@ -347,16 +508,11 @@ private fun CompactVolumePanel(
                 Box(
                     Modifier
                         .fillMaxWidth()
-                        .height(4.dp)
-                        .clip(RoundedCornerShape(2.dp))
+                        .height(6.dp)
+                        .clip(RoundedCornerShape(3.dp))
                         .background(inactiveColor)
                 ) {
-                    Box(
-                        Modifier
-                            .fillMaxWidth(fraction)
-                            .fillMaxHeight()
-                            .background(activeColor)
-                    )
+                    Box(Modifier.fillMaxWidth(fraction).fillMaxHeight().background(activeColor))
                 }
             }
         )
@@ -368,6 +524,28 @@ private fun CompactVolumePanel(
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun CompactOpacityPanel(opacity: Float, onOpacityChange: (Float) -> Unit) {
+    var isEditing by remember { mutableStateOf(false) }
+    var hasFocus by remember { mutableStateOf(false) }
+    var inputValue by remember { mutableStateOf(TextFieldValue("")) }
+    val focusRequester = remember { FocusRequester() }
+
+    LaunchedEffect(isEditing) {
+        if (isEditing) {
+            hasFocus = false
+            val text = "${(opacity * 100).toInt()}"
+            inputValue = TextFieldValue(text, selection = TextRange(0, text.length))
+            kotlinx.coroutines.delay(50)
+            runCatching { focusRequester.requestFocus() }
+        }
+    }
+
+    fun commitInput() {
+        val v = inputValue.text.toIntOrNull()?.coerceIn(20, 100)
+        if (v != null) onOpacityChange(v / 100f)
+        isEditing = false
+        hasFocus = false
+    }
+
     Row(
         modifier = Modifier.fillMaxSize().padding(horizontal = 8.dp),
         verticalAlignment = Alignment.CenterVertically
@@ -386,14 +564,53 @@ private fun CompactOpacityPanel(opacity: Float, onOpacityChange: (Float) -> Unit
             modifier = Modifier.width(34.dp)
         )
 
-        Text(
-            "${(opacity * 100).toInt()}%",
-            fontSize = 10.sp,
-            color = MaterialTheme.colorScheme.onSurface,
-            textAlign = TextAlign.End,
-            maxLines = 1,
-            modifier = Modifier.width(34.dp)
-        )
+        if (isEditing) {
+            BasicTextField(
+                value = inputValue,
+                onValueChange = {
+                    inputValue = it.copy(text = it.text.filter(Char::isDigit).take(3))
+                },
+                modifier = Modifier
+                    .width(34.dp)
+                    .focusRequester(focusRequester)
+                    .onFocusChanged {
+                        if (it.isFocused) hasFocus = true
+                        else if (hasFocus) commitInput()
+                    }
+                    .onKeyEvent { event ->
+                        when {
+                            event.key == Key.Enter || event.key == Key.NumPadEnter -> {
+                                if (event.type == KeyEventType.KeyUp) commitInput()
+                                true
+                            }
+                            event.type == KeyEventType.KeyDown && event.key == Key.Escape -> {
+                                isEditing = false; hasFocus = false; true
+                            }
+                            else -> false
+                        }
+                    },
+                textStyle = TextStyle(
+                    fontSize = 10.sp,
+                    color = MaterialTheme.colorScheme.primary,
+                    textAlign = TextAlign.End
+                ),
+                singleLine = true,
+                cursorBrush = SolidColor(MaterialTheme.colorScheme.primary)
+            )
+        } else {
+            Text(
+                "${(opacity * 100).toInt()}%",
+                fontSize = 10.sp,
+                color = MaterialTheme.colorScheme.onSurface,
+                textAlign = TextAlign.End,
+                maxLines = 1,
+                modifier = Modifier
+                    .width(34.dp)
+                    .pointerInput(Unit) {
+                        detectTapGestures { isEditing = true }
+                    }
+            )
+        }
 
         Spacer(Modifier.width(4.dp))
 
@@ -412,16 +629,11 @@ private fun CompactOpacityPanel(opacity: Float, onOpacityChange: (Float) -> Unit
                 Box(
                     Modifier
                         .fillMaxWidth()
-                        .height(4.dp)
-                        .clip(RoundedCornerShape(2.dp))
+                        .height(6.dp)
+                        .clip(RoundedCornerShape(3.dp))
                         .background(inactiveColor)
                 ) {
-                    Box(
-                        Modifier
-                            .fillMaxWidth(fraction)
-                            .fillMaxHeight()
-                            .background(activeColor)
-                    )
+                    Box(Modifier.fillMaxWidth(fraction).fillMaxHeight().background(activeColor))
                 }
             }
         )
