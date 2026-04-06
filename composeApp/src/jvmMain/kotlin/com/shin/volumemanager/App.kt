@@ -87,19 +87,28 @@ fun App(
     var opacity by remember { mutableStateOf(0.95f) }
     var panelOnLeft by remember { mutableStateOf(false) }
     var isPanelExpanded by remember { mutableStateOf(false) }
+    // Holds the last non-null panelContent so the panel renders correctly during exit animation
+    var lastPanelContent by remember { mutableStateOf<PanelContent?>(null) }
     val screen = remember { GraphicsEnvironment.getLocalGraphicsEnvironment().maximumWindowBounds }
     val density = androidx.compose.ui.platform.LocalDensity.current
 
     // Snap to screen corner while dragging (works with panel open or closed).
     // When panel is open, snap/side-switch logic is based on the icon column position,
     // not the full expanded window, so the icon stays visually anchored.
+    // panelContent is intentionally NOT in the snapshotFlow — reading it inside collect
+    // prevents it from triggering this flow when the user clicks an icon, which would
+    // conflict with LaunchedEffect(panelContent) and cause a double-shift.
     LaunchedEffect(Unit) {
-        snapshotFlow { Triple(windowState.position, windowState.size, panelContent) }
-            .collect { (pos, size, content) ->
+        snapshotFlow { windowState.position to windowState.size }
+            .collect { (pos, size) ->
                 if (pos !is WindowPosition.Absolute) return@collect
+                val content = panelContent
+                // While the panel is opening, LaunchedEffect(panelContent) is handling
+                // position/size; skip here to avoid a second shift.
+                if (content != null && !isPanelExpanded) return@collect
                 val scale       = density.density
-                val x           = (pos.x.value  * scale).toInt()
-                val y           = (pos.y.value  * scale).toInt()
+                val x           = (pos.x.value       * scale).toInt()
+                val y           = (pos.y.value       * scale).toInt()
                 val w           = (size.width.value  * scale).toInt()
                 val h           = (size.height.value * scale).toInt()
                 val collapsedPx = (COLLAPSED_W.value  * scale).toInt()
@@ -177,6 +186,7 @@ fun App(
     val panelShiftW = PANEL_W + PANEL_GAP + 4.dp
     LaunchedEffect(panelContent) {
         if (panelContent != null) {
+            lastPanelContent = panelContent   // cache for exit-animation rendering
             // Only compute side and shift when going from closed → open.
             // If already expanded (e.g. switching sessions), skip — otherwise
             // the window shifts left again on every session switch.
@@ -212,8 +222,9 @@ fun App(
         }
     }
 
-    // Y coordinate for the floating panel
-    val panelY: Dp = when (val c = panelContent) {
+    // Y coordinate for the floating panel — uses lastPanelContent so the panel
+    // doesn't jump to a default position while the exit animation is playing.
+    val panelY: Dp = when (val c = lastPanelContent) {
         is PanelContent.VolumeSession -> {
             val idx = sessions.indexOfFirst { it.pid == c.pid }
             if (idx >= 0) ICONS_START_Y + ICON_STEP * idx else ICONS_START_Y
@@ -338,7 +349,8 @@ fun App(
                     color = MaterialTheme.colorScheme.surface,
                     tonalElevation = 4.dp
                 ) {
-                    when (val c = panelContent) {
+                    // Use lastPanelContent so content stays visible during exit animation
+                    when (val c = lastPanelContent) {
                         is PanelContent.VolumeSession ->
                             sessions.find { it.pid == c.pid }?.let { session ->
                                 CompactVolumePanel(
