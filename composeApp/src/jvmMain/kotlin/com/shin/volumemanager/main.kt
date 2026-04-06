@@ -11,7 +11,7 @@ fun main() = application {
     val audioManager = remember { AudioManager() }
     val windowState = rememberWindowState(
         width = 64.dp,
-        height = 480.dp,
+        height = 200.dp,
         position = WindowPosition.PlatformDefault
     )
 

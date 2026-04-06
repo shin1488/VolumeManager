@@ -1,28 +1,14 @@
-This is a Kotlin Multiplatform project targeting Desktop (JVM).
+# VolumeManager
 
-* [/composeApp](./composeApp/src) is for code that will be shared across your Compose Multiplatform applications.
-  It contains several subfolders:
-    - [commonMain](./composeApp/src/commonMain/kotlin) is for code that’s common for all targets.
-    - Other folders are for Kotlin code that will be compiled for only the platform indicated in the folder name.
-      For example, if you want to use Apple’s CoreCrypto for the iOS part of your Kotlin app,
-      the [iosMain](./composeApp/src/iosMain/kotlin) folder would be the right place for such calls.
-      Similarly, if you want to edit the Desktop (JVM) specific part, the [jvmMain](./composeApp/src/jvmMain/kotlin)
-      folder is the appropriate location.
+Windows 기본 볼륨 믹서 대신 쓰는 미니 볼륨 조절 앱.
 
-### Build and Run Desktop (JVM) Application
+오디오가 재생 중인 앱만 골라서 아이콘으로 보여주고, 클릭하면 그 자리에서 바로 볼륨을 조절할 수 있어요.
 
-To build and run the development version of the desktop app, use the run configuration from the run widget
-in your IDE’s toolbar or run it directly from the terminal:
+## 기능
 
-- on macOS/Linux
-  ```shell
-  ./gradlew :composeApp:run
-  ```
-- on Windows
-  ```shell
-  .\gradlew.bat :composeApp:run
-  ```
-
----
-
-Learn more about [Kotlin Multiplatform](https://www.jetbrains.com/help/kotlin-multiplatform-dev/get-started.html)…
+- 오디오 출력 중인 앱을 아이콘으로 표시
+- 아이콘 클릭 → 볼륨 슬라이더 팝업
+- 개별 뮤트 토글
+- 화면 최상단 고정 (항상 위)
+- 창 투명도 조절
+- 다크 테마 플로팅 UI

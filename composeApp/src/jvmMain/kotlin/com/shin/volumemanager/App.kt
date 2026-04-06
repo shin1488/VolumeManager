@@ -20,7 +20,6 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.text.style.TextAlign
-import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.DpSize
 import androidx.compose.ui.unit.dp
@@ -32,26 +31,27 @@ import com.shin.volumemanager.model.AudioSession
 private const val ANIM_MS = 120
 private val COLLAPSED_W = 60.dp
 private val PANEL_W = 204.dp
-private val PANEL_H = 40.dp          // same as ICON_BOX → lines up perfectly
+private val PANEL_H = 40.dp
 private val PANEL_GAP = 8.dp
-private val EXPANDED_W = COLLAPSED_W + PANEL_GAP + PANEL_W + 4.dp  // 276dp
+private val EXPANDED_W = COLLAPSED_W + PANEL_GAP + PANEL_W + 4.dp
 
 private val ICON_BOX = 40.dp
 private val ICON_IMG = 26.dp
 private val ICON_DEF = 20.dp
 
-// Y position of the first session icon within the window Box
-// Surface top padding: 4dp · Column top padding: 6dp · Pin: 40dp · Divider: 5dp
-private val ICONS_START_Y = 4.dp + 6.dp + 40.dp + 5.dp   // = 55dp
-private val ICON_STEP = 42.dp                              // ICON_BOX(40) + Spacer(2)
+// Y positions within the window Box
+// Surface padding 4dp · Column top padding 6dp · Pin 40dp · Opacity 40dp · Divider 5dp
+private val OPACITY_Y    = 4.dp + 6.dp + 40.dp               // = 50dp  (right below pin)
+private val ICONS_START_Y = OPACITY_Y + 40.dp + 5.dp         // = 95dp  (after opacity + divider)
+private val ICON_STEP    = 42.dp                              // ICON_BOX(40) + Spacer(2)
 
 sealed class PanelContent {
     data class VolumeSession(val pid: Int) : PanelContent()
     data object Opacity : PanelContent()
 }
 
-// Total height = surface pads(8) + col pads(12) + pin(40) + 2×dividers(10) + N×42 + opacity(40) + close(40)
-// = 150 + N×42
+// surface pads(8) + col pads(12) + pin(40) + opacity(40) + 2×dividers(10) + close(40) = 150
+// + sessions N×42
 private fun windowHeight(sessionCount: Int): Dp =
     maxOf(200.dp, (150 + sessionCount * 42).dp)
 
@@ -85,13 +85,13 @@ fun App(
         }
     }
 
-    // Y coordinate for the floating panel (aligns to the clicked icon)
+    // Y coordinate for the floating panel
     val panelY: Dp = when (val c = panelContent) {
         is PanelContent.VolumeSession -> {
             val idx = sessions.indexOfFirst { it.pid == c.pid }
             if (idx >= 0) ICONS_START_Y + ICON_STEP * idx else ICONS_START_Y
         }
-        PanelContent.Opacity -> ICONS_START_Y + ICON_STEP * sessions.size + 5.dp
+        PanelContent.Opacity -> OPACITY_Y
         null -> ICONS_START_Y
     }
 
@@ -115,11 +115,32 @@ fun App(
                         modifier = Modifier.size(ICON_BOX)
                     ) {
                         Icon(
-                            Icons.Default.PushPin,
-                            "Always on top",
+                            Icons.Default.PushPin, "Always on top",
                             tint = if (isAlwaysOnTop) MaterialTheme.colorScheme.primary
                             else MaterialTheme.colorScheme.onSurfaceVariant,
                             modifier = Modifier.size(16.dp)
+                        )
+                    }
+
+                    // Opacity button — grouped with pin
+                    val isOpacitySelected = panelContent is PanelContent.Opacity
+                    Box(
+                        modifier = Modifier
+                            .size(ICON_BOX)
+                            .clip(CircleShape)
+                            .background(
+                                if (isOpacitySelected) MaterialTheme.colorScheme.primary.copy(0.15f)
+                                else Color.Transparent
+                            )
+                            .clickable {
+                                panelContent = if (isOpacitySelected) null else PanelContent.Opacity
+                            },
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Icon(
+                            Icons.Default.Opacity, "투명도", Modifier.size(ICON_DEF),
+                            tint = if (isOpacitySelected) MaterialTheme.colorScheme.primary
+                            else MaterialTheme.colorScheme.onSurfaceVariant
                         )
                     }
 
@@ -144,28 +165,6 @@ fun App(
                     if (sessions.isEmpty()) Spacer(Modifier.height(ICON_BOX))
 
                     ColumnDivider()
-
-                    // Opacity button
-                    val isOpacitySelected = panelContent is PanelContent.Opacity
-                    Box(
-                        modifier = Modifier
-                            .size(ICON_BOX)
-                            .clip(CircleShape)
-                            .background(
-                                if (isOpacitySelected) MaterialTheme.colorScheme.primary.copy(0.15f)
-                                else Color.Transparent
-                            )
-                            .clickable {
-                                panelContent = if (isOpacitySelected) null else PanelContent.Opacity
-                            },
-                        contentAlignment = Alignment.Center
-                    ) {
-                        Icon(
-                            Icons.Default.Opacity, "Opacity", Modifier.size(ICON_DEF),
-                            tint = if (isOpacitySelected) MaterialTheme.colorScheme.primary
-                            else MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-                    }
 
                     Spacer(Modifier.weight(1f))
 
@@ -278,6 +277,7 @@ private fun SessionIconButton(
 
 // ── Compact volume panel ───────────────────────────────────────────
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun CompactVolumePanel(
     session: AudioSession,
@@ -295,39 +295,23 @@ private fun CompactVolumePanel(
         modifier = Modifier.fillMaxSize().padding(horizontal = 8.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
-        // Mute toggle icon
+        // Mute toggle
         Box(
-            modifier = Modifier
-                .size(26.dp)
-                .clip(CircleShape)
-                .clickable(onClick = onMuteToggle),
+            modifier = Modifier.size(26.dp).clip(CircleShape).clickable(onClick = onMuteToggle),
             contentAlignment = Alignment.Center
         ) {
             Icon(
                 if (session.isMuted) Icons.AutoMirrored.Filled.VolumeOff
                 else Icons.AutoMirrored.Filled.VolumeUp,
-                null,
-                Modifier.size(14.dp),
+                null, Modifier.size(14.dp),
                 tint = if (session.isMuted) MaterialTheme.colorScheme.error
                 else MaterialTheme.colorScheme.primary
             )
         }
 
-        Spacer(Modifier.width(5.dp))
+        Spacer(Modifier.width(4.dp))
 
-        // Process name
-        Text(
-            session.displayName,
-            fontSize = 10.sp,
-            color = MaterialTheme.colorScheme.onSurface.copy(
-                alpha = if (session.isMuted) 0.4f else 0.75f
-            ),
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
-            modifier = Modifier.width(50.dp)
-        )
-
-        // Volume %
+        // Volume % — wide enough for "100%"
         Text(
             "${(localVolume * 100).toInt()}%",
             fontSize = 10.sp,
@@ -335,12 +319,18 @@ private fun CompactVolumePanel(
                 alpha = if (session.isMuted) 0.4f else 1f
             ),
             textAlign = TextAlign.End,
-            modifier = Modifier.width(26.dp)
+            maxLines = 1,
+            modifier = Modifier.width(34.dp)
         )
 
         Spacer(Modifier.width(4.dp))
 
-        // Slider
+        // Slider with uniform track shape
+        val activeColor = if (session.isMuted)
+            MaterialTheme.colorScheme.onSurface.copy(alpha = 0.2f)
+        else MaterialTheme.colorScheme.primary
+        val inactiveColor = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.12f)
+
         Slider(
             value = localVolume,
             onValueChange = {
@@ -351,18 +341,31 @@ private fun CompactVolumePanel(
             onValueChangeFinished = { isDragging = false },
             modifier = Modifier.weight(1f),
             enabled = !session.isMuted,
-            colors = SliderDefaults.colors(
-                thumbColor = MaterialTheme.colorScheme.primary,
-                activeTrackColor = MaterialTheme.colorScheme.primary,
-                disabledThumbColor = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.3f),
-                disabledActiveTrackColor = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.2f)
-            )
+            thumb = {},
+            track = { state ->
+                val fraction = (state.value / state.valueRange.endInclusive).coerceIn(0f, 1f)
+                Box(
+                    Modifier
+                        .fillMaxWidth()
+                        .height(4.dp)
+                        .clip(RoundedCornerShape(2.dp))
+                        .background(inactiveColor)
+                ) {
+                    Box(
+                        Modifier
+                            .fillMaxWidth(fraction)
+                            .fillMaxHeight()
+                            .background(activeColor)
+                    )
+                }
+            }
         )
     }
 }
 
 // ── Compact opacity panel ──────────────────────────────────────────
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun CompactOpacityPanel(opacity: Float, onOpacityChange: (Float) -> Unit) {
     Row(
@@ -377,10 +380,10 @@ private fun CompactOpacityPanel(opacity: Float, onOpacityChange: (Float) -> Unit
         Spacer(Modifier.width(5.dp))
 
         Text(
-            "Opacity",
+            "투명도",
             fontSize = 10.sp,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
-            modifier = Modifier.width(40.dp)
+            modifier = Modifier.width(34.dp)
         )
 
         Text(
@@ -388,21 +391,39 @@ private fun CompactOpacityPanel(opacity: Float, onOpacityChange: (Float) -> Unit
             fontSize = 10.sp,
             color = MaterialTheme.colorScheme.onSurface,
             textAlign = TextAlign.End,
-            modifier = Modifier.width(26.dp)
+            maxLines = 1,
+            modifier = Modifier.width(34.dp)
         )
 
         Spacer(Modifier.width(4.dp))
+
+        val activeColor = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f)
+        val inactiveColor = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.2f)
 
         Slider(
             value = opacity,
             onValueChange = onOpacityChange,
             valueRange = 0.2f..1f,
             modifier = Modifier.weight(1f),
-            colors = SliderDefaults.colors(
-                thumbColor = MaterialTheme.colorScheme.onSurfaceVariant,
-                activeTrackColor = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f),
-                inactiveTrackColor = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.2f)
-            )
+            thumb = {},
+            track = { state ->
+                val fraction = ((state.value - state.valueRange.start) /
+                        (state.valueRange.endInclusive - state.valueRange.start)).coerceIn(0f, 1f)
+                Box(
+                    Modifier
+                        .fillMaxWidth()
+                        .height(4.dp)
+                        .clip(RoundedCornerShape(2.dp))
+                        .background(inactiveColor)
+                ) {
+                    Box(
+                        Modifier
+                            .fillMaxWidth(fraction)
+                            .fillMaxHeight()
+                            .background(activeColor)
+                    )
+                }
+            }
         )
     }
 }
