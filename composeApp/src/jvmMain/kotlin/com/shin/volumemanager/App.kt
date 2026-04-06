@@ -90,32 +90,72 @@ fun App(
     val screen = remember { GraphicsEnvironment.getLocalGraphicsEnvironment().maximumWindowBounds }
     val density = androidx.compose.ui.platform.LocalDensity.current
 
-    // Snap to screen corner while dragging near a corner (immediate, during drag)
-    // All math is done in physical pixels to avoid DPI-scaling mismatches.
+    // Snap to screen corner while dragging (works with panel open or closed).
+    // When panel is open, snap/side-switch logic is based on the icon column position,
+    // not the full expanded window, so the icon stays visually anchored.
     LaunchedEffect(Unit) {
         snapshotFlow { Triple(windowState.position, windowState.size, panelContent) }
             .collect { (pos, size, content) ->
-                if (content != null || pos !is WindowPosition.Absolute) return@collect
-                val scale = density.density
-                // Convert dp → physical pixels
-                val x = (pos.x.value * scale).toInt()
-                val y = (pos.y.value * scale).toInt()
-                val w = (size.width.value * scale).toInt()
-                val h = (size.height.value * scale).toInt()
-                // Threshold = half the window width (≈30px at 100% on this app)
-                val threshold = (w / 2).coerceAtMost((20 * scale).toInt())
-                val nearLeft   = x - screen.x          < threshold
-                val nearRight  = (screen.x + screen.width)  - (x + w) < threshold
-                val nearTop    = y - screen.y           < threshold
-                val nearBottom = (screen.y + screen.height) - (y + h) < threshold
-                if ((nearLeft || nearRight) && (nearTop || nearBottom)) {
-                    val snapXpx = if (nearLeft) screen.x else screen.x + screen.width - w
-                    val snapYpx = if (nearTop)  screen.y else screen.y + screen.height - h
-                    if (x != snapXpx || y != snapYpx)
-                        windowState.position = WindowPosition(
-                            (snapXpx / scale).dp,
-                            (snapYpx / scale).dp
-                        )
+                if (pos !is WindowPosition.Absolute) return@collect
+                val scale       = density.density
+                val x           = (pos.x.value  * scale).toInt()
+                val y           = (pos.y.value  * scale).toInt()
+                val w           = (size.width.value  * scale).toInt()
+                val h           = (size.height.value * scale).toInt()
+                val collapsedPx = (COLLAPSED_W.value  * scale).toInt()
+                val expandedPx  = (EXPANDED_W.value   * scale).toInt()
+                val shiftPx     = expandedPx - collapsedPx
+
+                if (content != null) {
+                    // ── Panel open: use icon column bounds ──────────────
+                    val iconLeft  = if (panelOnLeft) x + w - collapsedPx else x
+                    val iconRight = iconLeft + collapsedPx
+                    val iconCenterX = (iconLeft + iconRight) / 2
+                    val screenCenterX = screen.x + screen.width / 2
+                    val threshold = (collapsedPx / 2).coerceAtMost((20 * scale).toInt())
+
+                    val nearLeft   = iconLeft  - screen.x                   < threshold
+                    val nearRight  = screen.x + screen.width - iconRight     < threshold
+                    val nearTop    = y         - screen.y                    < threshold
+                    val nearBottom = screen.y + screen.height - (y + h)      < threshold
+
+                    if ((nearLeft || nearRight) && (nearTop || nearBottom)) {
+                        // Snap to corner – icon column goes to the wall that triggered snap.
+                        // Left snap → panel on right (panelOnLeft=false).
+                        // Right snap → panel on left (panelOnLeft=true).
+                        val snapPanelOnLeft = nearRight
+                        val snapX = if (nearRight) screen.x + screen.width - expandedPx
+                                    else           screen.x
+                        val snapY = if (nearTop)   screen.y
+                                    else           screen.y + screen.height - h
+                        val posChanged  = x != snapX || y != snapY
+                        val sideChanged = snapPanelOnLeft != panelOnLeft
+                        if (sideChanged) panelOnLeft = snapPanelOnLeft
+                        if (posChanged || sideChanged)
+                            windowState.position = WindowPosition((snapX / scale).dp, (snapY / scale).dp)
+                    } else {
+                        // No corner snap: flip sides when icon column center crosses screen center.
+                        // The window shifts so the icon column stays at the same screen position.
+                        val shouldBeOnLeft = iconCenterX > screenCenterX
+                        if (shouldBeOnLeft != panelOnLeft) {
+                            val newX = if (shouldBeOnLeft) x - shiftPx else x + shiftPx
+                            panelOnLeft = shouldBeOnLeft
+                            windowState.position = WindowPosition((newX / scale).dp, pos.y)
+                        }
+                    }
+                } else {
+                    // ── Panel closed: standard snap on full window ──────
+                    val threshold = (w / 2).coerceAtMost((20 * scale).toInt())
+                    val nearLeft   = x - screen.x                    < threshold
+                    val nearRight  = screen.x + screen.width - (x + w) < threshold
+                    val nearTop    = y - screen.y                     < threshold
+                    val nearBottom = screen.y + screen.height - (y + h) < threshold
+                    if ((nearLeft || nearRight) && (nearTop || nearBottom)) {
+                        val snapX = if (nearLeft) screen.x else screen.x + screen.width - w
+                        val snapY = if (nearTop)  screen.y else screen.y + screen.height - h
+                        if (x != snapX || y != snapY)
+                            windowState.position = WindowPosition((snapX / scale).dp, (snapY / scale).dp)
+                    }
                 }
             }
     }
