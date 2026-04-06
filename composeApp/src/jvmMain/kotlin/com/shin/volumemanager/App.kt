@@ -206,6 +206,12 @@ fun App(
                 }
                 windowState.size = DpSize(EXPANDED_W, windowState.size.height)
                 isPanelExpanded = true
+                // When the window shifts left (right-side case), the OS move+resize
+                // causes the previous frame's content to flash briefly before Compose
+                // repaints. Wait one frame so the window settles before starting the
+                // panel enter animation. Left-side opens don't need this because there
+                // is no position shift, only a size change.
+                if (panelOnLeft) kotlinx.coroutines.delay(16)
             }
             showPanel = true
         } else {
