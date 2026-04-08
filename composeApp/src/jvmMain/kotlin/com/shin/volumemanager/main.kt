@@ -1,47 +1,28 @@
 package com.shin.volumemanager
 
-import androidx.compose.foundation.window.WindowDraggableArea
-import androidx.compose.runtime.*
-import androidx.compose.ui.unit.dp
-import androidx.compose.ui.window.*
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.remember
+import androidx.compose.ui.window.application
 import com.shin.volumemanager.audio.AudioManager
+import com.shin.volumemanager.state.VolumeManagerViewModel
+import com.shin.volumemanager.ui.AppRoot
 
+/**
+ * Process entry point. Wires the platform [AudioManager] into a
+ * [VolumeManagerViewModel] and hands the view model to [AppRoot], which owns
+ * all UI. Disposal is handled in a single place via [DisposableEffect] so
+ * COM resources are released even on hard exit.
+ */
 fun main() = application {
-    var isAlwaysOnTop by remember { mutableStateOf(false) }
     val audioManager = remember { AudioManager() }
-    val windowState = rememberWindowState(
-        width = 64.dp,
-        height = 200.dp,
-        position = WindowPosition.PlatformDefault
-    )
+    val viewModel = remember { VolumeManagerViewModel(audioManager) }
 
     DisposableEffect(Unit) {
-        onDispose { audioManager.dispose() }
+        onDispose { viewModel.dispose() }
     }
 
-    Window(
-        onCloseRequest = {
-            audioManager.dispose()
-            exitApplication()
-        },
-        state = windowState,
-        undecorated = true,
-        transparent = true,
-        alwaysOnTop = isAlwaysOnTop,
-        title = "Volume Manager",
-        resizable = false
-    ) {
-        WindowDraggableArea {
-            App(
-                audioManager = audioManager,
-                windowState = windowState,
-                isAlwaysOnTop = isAlwaysOnTop,
-                onAlwaysOnTopChange = { isAlwaysOnTop = it },
-                onClose = {
-                    audioManager.dispose()
-                    exitApplication()
-                }
-            )
-        }
-    }
+    AppRoot(
+        viewModel = viewModel,
+        onClose = ::exitApplication,
+    )
 }
