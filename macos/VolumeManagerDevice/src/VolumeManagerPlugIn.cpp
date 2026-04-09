@@ -47,10 +47,13 @@ static os_log_t                          gLog       = OS_LOG_DEFAULT;
 
 // ---------- IUnknown plumbing -------------------------------------------------
 
+// Forward declarations so QueryInterface can call AddRef.
+static ULONG VolumeManager_AddRef(void* /*inDriver*/)  { return 1; }
+static ULONG VolumeManager_Release(void* /*inDriver*/) { return 1; }
+
 static HRESULT VolumeManager_QueryInterface(void* inDriver, REFIID inUUID, LPVOID* outInterface) {
-    // Build a CFUUIDRef from the raw bytes so we can compare it.
-    CFUUIDRef requestedUUID = CFUUIDCreateFromUUIDBytes(kCFAllocatorDefault,
-                                                        *(const CFUUIDBytes*)inUUID);
+    // REFIID is CFUUIDBytes (a struct value, not a pointer) on macOS.
+    CFUUIDRef requestedUUID = CFUUIDCreateFromUUIDBytes(kCFAllocatorDefault, inUUID);
 
     // coreaudiod queries for kAudioServerPlugInDriverInterfaceUUID on startup.
     // We must return our driver ref for that UUID; everything else is rejected.
@@ -65,9 +68,6 @@ static HRESULT VolumeManager_QueryInterface(void* inDriver, REFIID inUUID, LPVOI
     if (outInterface) *outInterface = nullptr;
     return E_NOINTERFACE;
 }
-
-static ULONG VolumeManager_AddRef(void* /*inDriver*/)  { return 1; }
-static ULONG VolumeManager_Release(void* /*inDriver*/) { return 1; }
 
 // ---------- Lifecycle ---------------------------------------------------------
 
