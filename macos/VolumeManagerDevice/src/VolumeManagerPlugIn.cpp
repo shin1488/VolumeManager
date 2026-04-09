@@ -36,9 +36,11 @@
 static const char* kPlugIn_BundleID = "com.shin.volumemanager.device";
 
 // Single global driver interface table. coreaudiod expects the factory to
-// return a pointer to a pointer to this table.
-static AudioServerPlugInDriverInterface gDriverInterface;
-static AudioServerPlugInDriverRef       gDriverRef        = &gDriverInterface;
+// return a pointer to a pointer to this table (AudioServerPlugInDriverRef is
+// AudioServerPlugInDriverInterface**, i.e. a double pointer).
+static AudioServerPlugInDriverInterface  gDriverInterface;
+static AudioServerPlugInDriverInterface* gDriverPtr = &gDriverInterface;
+static AudioServerPlugInDriverRef        gDriverRef = &gDriverPtr;
 static AudioServerPlugInHostRef         gHost             = nullptr;
 static pthread_mutex_t                  gStateLock        = PTHREAD_MUTEX_INITIALIZER;
 
@@ -170,13 +172,14 @@ static OSStatus VolumeManager_BeginIOOperation(AudioServerPlugInDriverRef,
                                                UInt32,
                                                const AudioServerPlugInIOCycleInfo*) { return noErr; }
 static OSStatus VolumeManager_DoIOOperation(AudioServerPlugInDriverRef,
-                                            AudioObjectID,
-                                            AudioObjectID,
-                                            UInt32,
-                                            UInt32,
+                                            AudioObjectID,  // inDeviceObjectID
+                                            AudioObjectID,  // inStreamObjectID
+                                            UInt32,         // inClientID
+                                            UInt32,         // inOperationID
+                                            UInt32,         // inIOBufferFrameSize
                                             const AudioServerPlugInIOCycleInfo*,
-                                            void*,
-                                            void*) {
+                                            void*,          // ioMainBuffer
+                                            void*) {        // ioSecondaryBuffer
     // TODO(macos): apply per-client gain here before forwarding the buffer.
     return noErr;
 }
