@@ -1,6 +1,6 @@
 package com.shin.volumemanager.state
 
-import com.shin.volumemanager.audio.AudioManager
+import com.shin.volumemanager.audio.AudioSessionService
 import com.shin.volumemanager.model.PanelContent
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -16,11 +16,11 @@ import kotlinx.coroutines.launch
  * Holds [VolumeManagerState] and processes [VolumeManagerIntent]s.
  *
  * UI layer reads [state] reactively and dispatches user actions through
- * [handle]. Audio I/O is delegated to the injected [AudioManager]; this class
+ * [handle]. Audio I/O is delegated to the injected [AudioSessionService]; this class
  * owns no platform/Compose types so it can be unit-tested in isolation.
  */
 class VolumeManagerViewModel(
-    private val audioManager: AudioManager,
+    private val audioService: AudioSessionService,
 ) {
     private val _state = MutableStateFlow(VolumeManagerState())
     val state: StateFlow<VolumeManagerState> = _state.asStateFlow()
@@ -32,7 +32,7 @@ class VolumeManagerViewModel(
         // currently selected session disappears (process exited), close the
         // panel automatically so the UI doesn't show a stale slider.
         scope.launch {
-            audioManager.sessions.collect { sessions ->
+            audioService.sessions.collect { sessions ->
                 _state.update { current ->
                     val pc = current.panelContent
                     val newPanel = if (pc is PanelContent.VolumeSession &&
@@ -50,11 +50,11 @@ class VolumeManagerViewModel(
                 _state.update { it.copy(panelContent = intent.content) }
 
             is VolumeManagerIntent.SetVolume ->
-                audioManager.setVolume(intent.pid, intent.volume)
+                audioService.setVolume(intent.pid, intent.volume)
 
             is VolumeManagerIntent.ToggleMute -> {
                 val s = _state.value.sessions.find { it.pid == intent.pid } ?: return
-                audioManager.setMute(intent.pid, !s.isMuted)
+                audioService.setMute(intent.pid, !s.isMuted)
             }
 
             is VolumeManagerIntent.SetOpacity ->
@@ -70,6 +70,6 @@ class VolumeManagerViewModel(
 
     fun dispose() {
         scope.cancel()
-        audioManager.dispose()
+        audioService.dispose()
     }
 }

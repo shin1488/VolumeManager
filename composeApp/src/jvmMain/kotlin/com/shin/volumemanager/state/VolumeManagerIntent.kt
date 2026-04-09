@@ -10,10 +10,10 @@ sealed class VolumeManagerIntent {
     /** Open a side panel, or pass `null` to close it. */
     data class SelectPanel(val content: PanelContent?) : VolumeManagerIntent()
 
-    /** Set per-session volume (0..1). Forwarded to AudioManager. */
+    /** Set per-session volume (0..1). Forwarded to AudioSessionService. */
     data class SetVolume(val pid: Int, val volume: Float) : VolumeManagerIntent()
 
-    /** Toggle mute on a session. Forwarded to AudioManager. */
+    /** Toggle mute on a session. Forwarded to AudioSessionService. */
     data class ToggleMute(val pid: Int) : VolumeManagerIntent()
 
     /** Set the global window opacity (0.2..1.0). */
