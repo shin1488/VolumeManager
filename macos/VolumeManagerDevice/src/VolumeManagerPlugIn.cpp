@@ -38,7 +38,7 @@
 #define kDevice_Name              "VolumeManager"
 #define kDevice_Manufacturer      "shin"
 #define kPlugIn_Manufacturer      "shin"
-#define kDevice_SampleRate        44100.0
+#define kDevice_SampleRate        48000.0
 #define kDevice_RingBufferSize    16384
 #define kDevice_NumChannels       2
 

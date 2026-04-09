@@ -52,13 +52,8 @@ enum HAL {
     /// Look up an AudioDeviceID by its UID. Returns `nil` when nothing
     /// matches, typically because the driver hasn't loaded yet.
     static func device(byUID uid: String) -> AudioDeviceID? {
-        var translation = AudioValueTranslation(
-            mInputData: Unmanaged.passUnretained(uid as CFString).toOpaque(),
-            mInputDataSize: UInt32(MemoryLayout<CFString>.size),
-            mOutputData: UnsafeMutableRawPointer.allocate(
-                byteCount: MemoryLayout<AudioDeviceID>.size, alignment: 1),
-            mOutputDataSize: UInt32(MemoryLayout<AudioDeviceID>.size))
-        defer { translation.mOutputData.deallocate() }
+        var deviceID = AudioDeviceID(kAudioObjectUnknown)
+        var cfUID: CFString = uid as CFString
 
         var address = AudioObjectPropertyAddress(
             mSelector: kAudioHardwarePropertyDeviceForUID,
@@ -66,14 +61,22 @@ enum HAL {
             mElement: kAudioObjectPropertyElementMain)
         var size = UInt32(MemoryLayout<AudioValueTranslation>.size)
 
-        let err = withUnsafeMutablePointer(to: &translation) { ptr -> OSStatus in
-            AudioObjectGetPropertyData(
-                AudioObjectID(kAudioObjectSystemObject),
-                &address, 0, nil, &size, ptr)
+        let err = withUnsafeMutablePointer(to: &cfUID) { uidPtr in
+            withUnsafeMutablePointer(to: &deviceID) { devPtr in
+                var translation = AudioValueTranslation(
+                    mInputData: uidPtr,
+                    mInputDataSize: UInt32(MemoryLayout<CFString>.size),
+                    mOutputData: devPtr,
+                    mOutputDataSize: UInt32(MemoryLayout<AudioDeviceID>.size))
+                return withUnsafeMutablePointer(to: &translation) { tPtr -> OSStatus in
+                    AudioObjectGetPropertyData(
+                        AudioObjectID(kAudioObjectSystemObject),
+                        &address, 0, nil, &size, tPtr)
+                }
+            }
         }
-        guard err == noErr else { return nil }
-        let id = translation.mOutputData.load(as: AudioDeviceID.self)
-        return id == kAudioObjectUnknown ? nil : id
+        guard err == noErr, deviceID != kAudioObjectUnknown else { return nil }
+        return deviceID
     }
 
     /// Current system default output device. Updated on
@@ -94,48 +97,89 @@ enum HAL {
 
 // MARK: - Ring buffer ---------------------------------------------------------
 
-/// Fixed-size interleaved Float32 ring buffer. One producer (capture
-/// IOProc) and one consumer (playback IOProc). No locks; relies on
-/// atomic 64-bit integer stores on modern macOS. Good enough for a
-/// 2ch/44.1k loopback.
+/// Lock-free SPSC ring buffer. Stores interleaved Float32 stereo frames.
+/// Write head and read head are monotonic 64-bit counters; slot =
+/// counter mod capacity. The consumer skips ahead if it falls too far
+/// behind (overflow protection), and outputs silence when it catches
+/// up (underrun protection).
 final class RingBuffer {
-    let capacityFrames: Int
+    let capacity: Int          // in frames
     let channels: Int
     private let storage: UnsafeMutablePointer<Float>
-    private var write: UInt64 = 0   // monotonic frame counter
-    private var read:  UInt64 = 0
+    // Volatile-ish via class reference semantics on 64-bit arm64.
+    private(set) var writeHead: Int = 0
+    private(set) var readHead:  Int = 0
 
     init(capacityFrames: Int, channels: Int) {
-        self.capacityFrames = capacityFrames
-        self.channels       = channels
-        self.storage = UnsafeMutablePointer<Float>.allocate(
-            capacity: capacityFrames * channels)
+        self.capacity = capacityFrames
+        self.channels = channels
+        self.storage  = .allocate(capacity: capacityFrames * channels)
         self.storage.initialize(repeating: 0, count: capacityFrames * channels)
     }
-
     deinit { storage.deallocate() }
 
-    func write(_ src: UnsafePointer<Float>, frames: Int) {
+    /// Store interleaved frames from `src`.
+    func store(_ src: UnsafePointer<Float>, frames: Int) {
         for i in 0..<frames {
-            let slot = Int(write % UInt64(capacityFrames))
+            let slot = writeHead % capacity
+            let off  = slot * channels
             for c in 0..<channels {
-                storage[slot * channels + c] = src[i * channels + c]
+                storage[off + c] = src[i * channels + c]
             }
-            write &+= 1
+            writeHead &+= 1
         }
     }
 
-    func read(into dst: UnsafeMutablePointer<Float>, frames: Int) {
-        // Underrun protection: if read caught up with write, output silence.
+    /// Store non-interleaved (planar) buffers — one pointer per channel.
+    func storePlanar(_ ptrs: [UnsafePointer<Float>], frames: Int) {
         for i in 0..<frames {
-            if read >= write {
+            let slot = writeHead % capacity
+            let off  = slot * channels
+            for c in 0..<min(channels, ptrs.count) {
+                storage[off + c] = ptrs[c][i]
+            }
+            writeHead &+= 1
+        }
+    }
+
+    /// Fetch interleaved frames into `dst`.
+    func fetch(into dst: UnsafeMutablePointer<Float>, frames: Int) {
+        // If writer is way ahead, skip to stay close.
+        let available = writeHead &- readHead
+        if available > capacity {
+            readHead = writeHead &- capacity / 2
+        }
+        for i in 0..<frames {
+            if readHead >= writeHead {
+                // underrun → silence
                 for c in 0..<channels { dst[i * channels + c] = 0 }
             } else {
-                let slot = Int(read % UInt64(capacityFrames))
+                let slot = readHead % capacity
+                let off  = slot * channels
                 for c in 0..<channels {
-                    dst[i * channels + c] = storage[slot * channels + c]
+                    dst[i * channels + c] = storage[off + c]
                 }
-                read &+= 1
+                readHead &+= 1
+            }
+        }
+    }
+
+    /// Fetch into separate per-channel (planar) buffers.
+    func fetchPlanar(into ptrs: [UnsafeMutablePointer<Float>], frames: Int) {
+        let available = writeHead &- readHead
+        if available > capacity {
+            readHead = writeHead &- capacity / 2
+        }
+        for i in 0..<frames {
+            if readHead >= writeHead {
+                for c in 0..<min(channels, ptrs.count) { ptrs[c][i] = 0 }
+            } else {
+                let slot = readHead % capacity
+                let off  = slot * channels
+                for c in 0..<min(channels, ptrs.count) {
+                    ptrs[c][i] = storage[off + c]
+                }
+                readHead &+= 1
             }
         }
     }
@@ -144,7 +188,8 @@ final class RingBuffer {
 // MARK: - Audio forwarder -----------------------------------------------------
 
 final class AudioForwarder {
-    private let ring = RingBuffer(capacityFrames: 16384, channels: 2)
+    // 32768 frames ≈ 0.68s at 48kHz — enough to absorb jitter.
+    private let ring = RingBuffer(capacityFrames: 32768, channels: 2)
     private var captureDevice:  AudioDeviceID = 0
     private var playbackDevice: AudioDeviceID = 0
     private var captureProcID:  AudioDeviceIOProcID?
@@ -169,48 +214,74 @@ final class AudioForwarder {
 
         let selfRef = Unmanaged.passUnretained(self).toOpaque()
 
-        // Capture IOProc: reads from VolumeManagerDevice input stream.
+        // --- Capture IOProc: VolumeManagerDevice input → ring buffer ---
         AudioDeviceCreateIOProcID(captureDevice, { (_, _, inputData, _, _, _, ctx) -> OSStatus in
             guard let ctx = ctx else { return noErr }
             let fwd = Unmanaged<AudioForwarder>.fromOpaque(ctx).takeUnretainedValue()
-            let bufList = inputData.pointee
-            if bufList.mNumberBuffers >= 1 {
-                let buf = withUnsafePointer(to: bufList.mBuffers) { $0.pointee }
-                if let data = buf.mData {
-                    let frames = Int(buf.mDataByteSize) /
-                                 MemoryLayout<Float>.size /
-                                 Int(buf.mNumberChannels)
-                    fwd.ring.write(data.assumingMemoryBound(to: Float.self),
-                                   frames: frames)
+            let buffers = UnsafeMutableAudioBufferListPointer(
+                UnsafeMutablePointer(mutating: inputData))
+
+            if buffers.count == 1 && buffers[0].mNumberChannels == 2 {
+                // Interleaved stereo — our virtual device's format.
+                if let data = buffers[0].mData {
+                    let frames = Int(buffers[0].mDataByteSize) /
+                                 (MemoryLayout<Float>.size * Int(buffers[0].mNumberChannels))
+                    fwd.ring.store(data.assumingMemoryBound(to: Float.self), frames: frames)
+                }
+            } else if buffers.count >= 2 {
+                // Non-interleaved (planar) — one buffer per channel.
+                let frames = Int(buffers[0].mDataByteSize) / MemoryLayout<Float>.size
+                var ptrs: [UnsafePointer<Float>] = []
+                for i in 0..<min(2, buffers.count) {
+                    if let d = buffers[i].mData {
+                        ptrs.append(d.assumingMemoryBound(to: Float.self))
+                    }
+                }
+                if ptrs.count == 2 {
+                    fwd.ring.storePlanar(ptrs, frames: frames)
                 }
             }
             return noErr
         }, selfRef, &captureProcID)
 
-        // Playback IOProc: writes to the real default output device.
+        // --- Playback IOProc: ring buffer → real output device ---
         AudioDeviceCreateIOProcID(playbackDevice, { (_, _, _, _, outputData, _, ctx) -> OSStatus in
-            guard let ctx = ctx, let outputData = outputData else { return noErr }
+            guard let ctx = ctx else { return noErr }
             let fwd = Unmanaged<AudioForwarder>.fromOpaque(ctx).takeUnretainedValue()
-            let bufList = outputData.pointee
-            if bufList.mNumberBuffers >= 1 {
-                let buf = withUnsafePointer(to: bufList.mBuffers) { $0.pointee }
-                if let data = buf.mData {
-                    let frames = Int(buf.mDataByteSize) /
-                                 MemoryLayout<Float>.size /
-                                 Int(buf.mNumberChannels)
-                    fwd.ring.read(into: data.assumingMemoryBound(to: Float.self),
-                                  frames: frames)
+            let buffers = UnsafeMutableAudioBufferListPointer(outputData)
+
+            if buffers.count == 1 && buffers[0].mNumberChannels >= 2 {
+                // Interleaved
+                if let data = buffers[0].mData {
+                    let frames = Int(buffers[0].mDataByteSize) /
+                                 (MemoryLayout<Float>.size * Int(buffers[0].mNumberChannels))
+                    fwd.ring.fetch(into: data.assumingMemoryBound(to: Float.self), frames: frames)
+                }
+            } else if buffers.count >= 2 {
+                // Non-interleaved (planar) — common for built-in speakers.
+                let frames = Int(buffers[0].mDataByteSize) / MemoryLayout<Float>.size
+                var ptrs: [UnsafeMutablePointer<Float>] = []
+                for i in 0..<min(2, buffers.count) {
+                    if let d = buffers[i].mData {
+                        ptrs.append(d.assumingMemoryBound(to: Float.self))
+                    }
+                }
+                if ptrs.count >= 2 {
+                    fwd.ring.fetchPlanar(into: ptrs, frames: frames)
                 }
             }
             return noErr
         }, selfRef, &playbackProcID)
 
+        // Start capture first so ring buffer has data before playback reads.
         if let c = captureProcID  { AudioDeviceStart(captureDevice,  c) }
+        // Small pre-roll delay to avoid initial underrun.
+        usleep(50_000) // 50ms
         if let p = playbackProcID { AudioDeviceStart(playbackDevice, p) }
         running = true
 
         FileHandle.standardError.write(Data(
-            "VolumeManagerHelper: forwarder running\n".utf8))
+            "VolumeManagerHelper: forwarder running (capture=\(captureDevice) playback=\(playbackDevice))\n".utf8))
     }
 
     func stop() {
