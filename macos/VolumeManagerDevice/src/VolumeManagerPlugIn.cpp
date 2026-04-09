@@ -25,8 +25,8 @@
 
 #include <CoreAudio/AudioServerPlugIn.h>
 #include <CoreFoundation/CoreFoundation.h>
+#include <os/log.h>
 #include <pthread.h>
-#include <stdio.h>
 
 // ---------- Driver-wide state -------------------------------------------------
 
@@ -41,15 +41,27 @@ static const char* kPlugIn_BundleID = "com.shin.volumemanager.device";
 static AudioServerPlugInDriverInterface  gDriverInterface;
 static AudioServerPlugInDriverInterface* gDriverPtr = &gDriverInterface;
 static AudioServerPlugInDriverRef        gDriverRef = &gDriverPtr;
-static AudioServerPlugInHostRef         gHost             = nullptr;
-static pthread_mutex_t                  gStateLock        = PTHREAD_MUTEX_INITIALIZER;
+static AudioServerPlugInHostRef          gHost      = nullptr;
+static pthread_mutex_t                   gStateLock = PTHREAD_MUTEX_INITIALIZER;
+static os_log_t                          gLog       = OS_LOG_DEFAULT;
 
 // ---------- IUnknown plumbing -------------------------------------------------
 
 static HRESULT VolumeManager_QueryInterface(void* inDriver, REFIID inUUID, LPVOID* outInterface) {
-    (void)inDriver;
-    // TODO(macos): match kAudioServerPlugInDriverInterfaceUUID and return
-    //  gDriverRef; otherwise return E_NOINTERFACE.
+    // Build a CFUUIDRef from the raw bytes so we can compare it.
+    CFUUIDRef requestedUUID = CFUUIDCreateFromUUIDBytes(kCFAllocatorDefault,
+                                                        *(const CFUUIDBytes*)inUUID);
+
+    // coreaudiod queries for kAudioServerPlugInDriverInterfaceUUID on startup.
+    // We must return our driver ref for that UUID; everything else is rejected.
+    if (CFEqual(requestedUUID, kAudioServerPlugInDriverInterfaceUUID)) {
+        VolumeManager_AddRef(inDriver);
+        *outInterface = gDriverRef;
+        CFRelease(requestedUUID);
+        return 0; // S_OK
+    }
+
+    CFRelease(requestedUUID);
     if (outInterface) *outInterface = nullptr;
     return E_NOINTERFACE;
 }
@@ -62,7 +74,7 @@ static ULONG VolumeManager_Release(void* /*inDriver*/) { return 1; }
 static OSStatus VolumeManager_Initialize(AudioServerPlugInDriverRef /*inDriver*/,
                                          AudioServerPlugInHostRef   inHost) {
     gHost = inHost;
-    fprintf(stderr, "[VolumeManager] plug-in initialized\n");
+    os_log(gLog, "VolumeManagerDevice: plug-in initialized");
     // TODO(macos): allocate device/stream/control objects, load persisted
     //  volume state from prefs, notify the host of object additions.
     return noErr;
@@ -223,5 +235,7 @@ extern "C" void* VolumeManagerPlugIn_Create(CFAllocatorRef /*allocator*/, CFUUID
     gDriverInterface.DoIOOperation                   = VolumeManager_DoIOOperation;
     gDriverInterface.EndIOOperation                  = VolumeManager_EndIOOperation;
 
-    return &gDriverRef;
+    // gDriverRef is already AudioServerPlugInDriverInterface** (double pointer).
+    // Do NOT take &gDriverRef — that would make it a triple pointer.
+    return gDriverRef;
 }
