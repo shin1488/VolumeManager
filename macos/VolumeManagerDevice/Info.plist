@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!--
+    Audio Server Plug-in bundle metadata.
+
+    Apple requires the bundle type to be "APLG" and the principal class to
+    match the factory function exported from VolumeManagerPlugIn.cpp. The
+    factory UUID below must match kPlugIn_BundleID everywhere in code.
+  -->
+  <key>CFBundleDevelopmentRegion</key>
+  <string>en</string>
+
+  <key>CFBundleExecutable</key>
+  <string>VolumeManagerDevice</string>
+
+  <key>CFBundleIdentifier</key>
+  <string>com.shin.volumemanager.device</string>
+
+  <key>CFBundleInfoDictionaryVersion</key>
+  <string>6.0</string>
+
+  <key>CFBundleName</key>
+  <string>VolumeManagerDevice</string>
+
+  <key>CFBundlePackageType</key>
+  <string>BNDL</string>
+
+  <key>CFBundleShortVersionString</key>
+  <string>0.1.0</string>
+
+  <key>CFBundleSignature</key>
+  <string>APLG</string>
+
+  <key>CFBundleVersion</key>
+  <string>1</string>
+
+  <key>CFPlugInDynamicRegistration</key>
+  <string>NO</string>
+
+  <key>CFPlugInFactories</key>
+  <dict>
+    <!-- TODO(macos): generate a real UUID and mirror it in the .cpp file. -->
+    <key>00000000-0000-0000-0000-0000DEADBEEF</key>
+    <string>VolumeManagerPlugIn_Create</string>
+  </dict>
+
+  <key>CFPlugInTypes</key>
+  <dict>
+    <!-- AudioServerPlugIn type UUID. Do not change. -->
+    <key>443ABAB8-E7B3-491A-B985-BEB9187030DB</key>
+    <array>
+      <string>00000000-0000-0000-0000-0000DEADBEEF</string>
+    </array>
+  </dict>
+</dict>
+</plist>

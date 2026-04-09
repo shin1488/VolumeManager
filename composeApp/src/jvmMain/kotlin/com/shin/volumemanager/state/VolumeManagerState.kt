@@ -6,7 +6,7 @@ import com.shin.volumemanager.model.PanelContent
 /**
  * Immutable UI state for the Volume Manager.
  *
- * - [sessions]: live list of audio sessions from [AudioManager].
+ * - [sessions]: live list of audio sessions from [AudioSessionService].
  * - [panelContent]: which side panel (if any) the user has selected. `null`
  *   means no panel is shown.
  * - [panelOnLeft]: which side of the icon column the panel should appear on.

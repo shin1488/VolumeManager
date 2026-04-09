@@ -13,13 +13,19 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import java.io.File
 
+/**
+ * Windows implementation of [AudioSessionService] built on WASAPI's
+ * `IAudioSessionManager2` via JNA. This is the original implementation the
+ * app shipped with; only the class name and the `AudioSessionService`
+ * interface wiring were added when macOS support was scaffolded.
+ */
 @OptIn(ExperimentalCoroutinesApi::class)
-class AudioManager {
+class WindowsAudioSessionService : AudioSessionService {
     private val comDispatcher = newSingleThreadContext("COM-Audio")
     private val scope = CoroutineScope(SupervisorJob() + comDispatcher)
 
     private val _sessions = MutableStateFlow<List<AudioSession>>(emptyList())
-    val sessions: StateFlow<List<AudioSession>> = _sessions.asStateFlow()
+    override val sessions: StateFlow<List<AudioSession>> = _sessions.asStateFlow()
 
     private val iconCache = mutableMapOf<Int, ImageBitmap?>()
     private val volumeControls = mutableMapOf<Int, SimpleAudioVolume>()
@@ -156,7 +162,7 @@ class AudioManager {
         }
     }
 
-    fun setVolume(pid: Int, volume: Float) {
+    override fun setVolume(pid: Int, volume: Float) {
         scope.launch {
             try {
                 volumeControls[pid]?.setMasterVolume(volume.coerceIn(0f, 1f))
@@ -166,7 +172,7 @@ class AudioManager {
         }
     }
 
-    fun setMute(pid: Int, muted: Boolean) {
+    override fun setMute(pid: Int, muted: Boolean) {
         scope.launch {
             try {
                 volumeControls[pid]?.setMute(muted)
@@ -181,7 +187,7 @@ class AudioManager {
         volumeControls.clear()
     }
 
-    fun dispose() {
+    override fun dispose() {
         scope.cancel()
         comDispatcher.close()
     }
