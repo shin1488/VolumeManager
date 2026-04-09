@@ -49,6 +49,7 @@ enum {
     kObjectID_Stream_Output  = 3,
     kObjectID_Volume_Output  = 4,
     kObjectID_Mute_Output    = 5,
+    kObjectID_Stream_Input   = 6,
 };
 
 // ---------- Driver-wide state -------------------------------------------------
@@ -72,6 +73,13 @@ static Float64                           gAnchorHostTime    = 0;
 static Float32                           gMasterVolume      = 1.0f;
 static bool                              gMasterMute        = false;
 static UInt32                            gIOIsRunning       = 0;
+
+// Loopback ring buffer: WriteMix writes the mixed output here, ReadInput
+// reads it back so a user-space helper can tap the device as an input
+// stream and forward to the real default output device. Indexed by
+// sample time mod kDevice_RingBufferSize so writer/reader stay aligned
+// without an explicit read/write head.
+static Float32                           gRingBuffer[kDevice_RingBufferSize * kDevice_NumChannels];
 
 // ---------- Small helpers -----------------------------------------------------
 
@@ -208,6 +216,7 @@ static Boolean VolumeManager_HasProperty(AudioServerPlugInDriverRef,
         return false;
 
     case kObjectID_Stream_Output:
+    case kObjectID_Stream_Input:
         switch (inAddress->mSelector) {
         case kAudioObjectPropertyBaseClass:
         case kAudioObjectPropertyClass:
@@ -332,8 +341,24 @@ static OSStatus VolumeManager_GetPropertyDataSize(AudioServerPlugInDriverRef,
         case kAudioDevicePropertyIsHidden:
         case kAudioDevicePropertyZeroTimeStampPeriod:    *outDataSize = sizeof(UInt32); return noErr;
         case kAudioDevicePropertyNominalSampleRate:      *outDataSize = sizeof(Float64); return noErr;
-        case kAudioObjectPropertyOwnedObjects:           *outDataSize = 3 * sizeof(AudioObjectID); return noErr;
-        case kAudioDevicePropertyStreams:                *outDataSize = sizeof(AudioObjectID); return noErr;
+        case kAudioObjectPropertyOwnedObjects: {
+            AudioObjectPropertyScope scope = inAddress->mScope;
+            UInt32 count = 0;
+            if (scope == kAudioObjectPropertyScopeGlobal) count = 4;
+            else if (scope == kAudioObjectPropertyScopeOutput) count = 3;
+            else if (scope == kAudioObjectPropertyScopeInput)  count = 1;
+            *outDataSize = count * sizeof(AudioObjectID);
+            return noErr;
+        }
+        case kAudioDevicePropertyStreams: {
+            AudioObjectPropertyScope scope = inAddress->mScope;
+            UInt32 count = 0;
+            if (scope == kAudioObjectPropertyScopeGlobal) count = 2;
+            else if (scope == kAudioObjectPropertyScopeOutput) count = 1;
+            else if (scope == kAudioObjectPropertyScopeInput)  count = 1;
+            *outDataSize = count * sizeof(AudioObjectID);
+            return noErr;
+        }
         case kAudioObjectPropertyControlList:            *outDataSize = 2 * sizeof(AudioObjectID); return noErr;
         case kAudioDevicePropertyRelatedDevices:         *outDataSize = sizeof(AudioObjectID); return noErr;
         case kAudioDevicePropertyAvailableNominalSampleRates: *outDataSize = sizeof(AudioValueRange); return noErr;
@@ -342,6 +367,7 @@ static OSStatus VolumeManager_GetPropertyDataSize(AudioServerPlugInDriverRef,
         break;
 
     case kObjectID_Stream_Output:
+    case kObjectID_Stream_Input:
         switch (inAddress->mSelector) {
         case kAudioObjectPropertyBaseClass:
         case kAudioObjectPropertyClass:                       *outDataSize = sizeof(AudioClassID); return noErr;
@@ -509,24 +535,37 @@ static OSStatus VolumeManager_GetPropertyData(AudioServerPlugInDriverRef,
             return noErr;
         }
         case kAudioObjectPropertyOwnedObjects: {
+            // Filter by scope. Global scope = everything; input scope =
+            // just the input stream; output scope = output stream and
+            // the two controls (volume + mute).
             UInt32 n = inDataSize / sizeof(AudioObjectID);
             AudioObjectID* ids = (AudioObjectID*)outData;
             UInt32 written = 0;
-            AudioObjectID all[3] = { kObjectID_Stream_Output,
-                                     kObjectID_Volume_Output,
-                                     kObjectID_Mute_Output };
-            for (UInt32 i = 0; i < 3 && i < n; ++i) { ids[written++] = all[i]; }
+            AudioObjectPropertyScope scope = inAddress->mScope;
+            if (scope == kAudioObjectPropertyScopeGlobal || scope == kAudioObjectPropertyScopeOutput) {
+                if (written < n) ids[written++] = kObjectID_Stream_Output;
+                if (written < n) ids[written++] = kObjectID_Volume_Output;
+                if (written < n) ids[written++] = kObjectID_Mute_Output;
+            }
+            if (scope == kAudioObjectPropertyScopeGlobal || scope == kAudioObjectPropertyScopeInput) {
+                if (written < n) ids[written++] = kObjectID_Stream_Input;
+            }
             *outDataSize = written * sizeof(AudioObjectID);
             return noErr;
         }
         case kAudioDevicePropertyStreams: {
+            // Scope-aware: input, output, or both.
             UInt32 n = inDataSize / sizeof(AudioObjectID);
-            if (n >= 1) {
-                ((AudioObjectID*)outData)[0] = kObjectID_Stream_Output;
-                *outDataSize = sizeof(AudioObjectID);
-            } else {
-                *outDataSize = 0;
+            AudioObjectID* ids = (AudioObjectID*)outData;
+            UInt32 written = 0;
+            AudioObjectPropertyScope scope = inAddress->mScope;
+            if (scope == kAudioObjectPropertyScopeGlobal || scope == kAudioObjectPropertyScopeOutput) {
+                if (written < n) ids[written++] = kObjectID_Stream_Output;
             }
+            if (scope == kAudioObjectPropertyScopeGlobal || scope == kAudioObjectPropertyScopeInput) {
+                if (written < n) ids[written++] = kObjectID_Stream_Input;
+            }
+            *outDataSize = written * sizeof(AudioObjectID);
             return noErr;
         }
         case kAudioObjectPropertyControlList: {
@@ -558,8 +597,9 @@ static OSStatus VolumeManager_GetPropertyData(AudioServerPlugInDriverRef,
         }
         break;
 
-    // ===== Stream object =====
+    // ===== Stream object (output and input share most handling) =====
     case kObjectID_Stream_Output:
+    case kObjectID_Stream_Input:
         switch (inAddress->mSelector) {
         case kAudioObjectPropertyBaseClass:
             *(AudioClassID*)outData = kAudioObjectClassID;
@@ -576,10 +616,13 @@ static OSStatus VolumeManager_GetPropertyData(AudioServerPlugInDriverRef,
             *(UInt32*)outData = 1;
             *outDataSize = sizeof(UInt32); return noErr;
         case kAudioStreamPropertyDirection:
-            *(UInt32*)outData = 0; // 0 = output
+            // 0 = output, 1 = input
+            *(UInt32*)outData = (inObjectID == kObjectID_Stream_Input) ? 1 : 0;
             *outDataSize = sizeof(UInt32); return noErr;
         case kAudioStreamPropertyTerminalType:
-            *(UInt32*)outData = kAudioStreamTerminalTypeSpeaker;
+            *(UInt32*)outData = (inObjectID == kObjectID_Stream_Input)
+                ? kAudioStreamTerminalTypeMicrophone
+                : kAudioStreamTerminalTypeSpeaker;
             *outDataSize = sizeof(UInt32); return noErr;
         case kAudioStreamPropertyStartingChannel:
             *(UInt32*)outData = 1;
@@ -813,7 +856,8 @@ static OSStatus VolumeManager_WillDoIOOperation(AudioServerPlugInDriverRef,
                                                 UInt32 inOperationID,
                                                 Boolean* outWillDo,
                                                 Boolean* outWillDoInPlace) {
-    bool doOp = (inOperationID == kAudioServerPlugInIOOperationWriteMix);
+    bool doOp = (inOperationID == kAudioServerPlugInIOOperationWriteMix) ||
+                (inOperationID == kAudioServerPlugInIOOperationReadInput);
     if (outWillDo)        *outWillDo        = doOp;
     if (outWillDoInPlace) *outWillDoInPlace = true;
     return noErr;
@@ -827,22 +871,48 @@ static OSStatus VolumeManager_DoIOOperation(AudioServerPlugInDriverRef,
                                             AudioObjectID, AudioObjectID, UInt32,
                                             UInt32 inOperationID,
                                             UInt32 inIOBufferFrameSize,
-                                            const AudioServerPlugInIOCycleInfo*,
+                                            const AudioServerPlugInIOCycleInfo* inIOCycleInfo,
                                             void* ioMainBuffer, void*) {
-    if (inOperationID != kAudioServerPlugInIOOperationWriteMix) return noErr;
-    if (!ioMainBuffer) return noErr;
+    if (!ioMainBuffer || !inIOCycleInfo) return noErr;
 
-    // Apply master gain/mute. Per-client gain comes in Phase 3 once
-    // AddDeviceClient is wired to the XPC helper.
-    pthread_mutex_lock(&gStateLock);
-    Float32 gain = gMasterMute ? 0.0f : gMasterVolume;
-    pthread_mutex_unlock(&gStateLock);
+    if (inOperationID == kAudioServerPlugInIOOperationWriteMix) {
+        // Apply master gain/mute, then copy the mixed buffer into our
+        // ring buffer so the input stream can read it back out.
+        pthread_mutex_lock(&gStateLock);
+        Float32 gain = gMasterMute ? 0.0f : gMasterVolume;
+        pthread_mutex_unlock(&gStateLock);
 
-    if (gain != 1.0f) {
-        Float32* samples = (Float32*)ioMainBuffer;
-        UInt32 n = inIOBufferFrameSize * kDevice_NumChannels;
-        for (UInt32 i = 0; i < n; ++i) samples[i] *= gain;
+        Float32* src = (Float32*)ioMainBuffer;
+
+        UInt64 startFrame = (UInt64)inIOCycleInfo->mOutputTime.mSampleTime;
+        for (UInt32 i = 0; i < inIOBufferFrameSize; ++i) {
+            UInt32 ringFrame = (UInt32)((startFrame + i) % kDevice_RingBufferSize);
+            Float32* dst = &gRingBuffer[ringFrame * kDevice_NumChannels];
+            for (UInt32 c = 0; c < kDevice_NumChannels; ++c) {
+                Float32 s = src[i * kDevice_NumChannels + c] * gain;
+                dst[c] = s;
+                src[i * kDevice_NumChannels + c] = s; // keep in-place too
+            }
+        }
+        return noErr;
     }
+
+    if (inOperationID == kAudioServerPlugInIOOperationReadInput) {
+        // Serve the loopback: copy from the ring buffer into the
+        // caller's input buffer, using the input sample time. The HAL
+        // naturally reads a bit behind where WriteMix just wrote.
+        Float32* dst = (Float32*)ioMainBuffer;
+        UInt64 startFrame = (UInt64)inIOCycleInfo->mInputTime.mSampleTime;
+        for (UInt32 i = 0; i < inIOBufferFrameSize; ++i) {
+            UInt32 ringFrame = (UInt32)((startFrame + i) % kDevice_RingBufferSize);
+            Float32* src = &gRingBuffer[ringFrame * kDevice_NumChannels];
+            for (UInt32 c = 0; c < kDevice_NumChannels; ++c) {
+                dst[i * kDevice_NumChannels + c] = src[c];
+            }
+        }
+        return noErr;
+    }
+
     return noErr;
 }
 static OSStatus VolumeManager_EndIOOperation(AudioServerPlugInDriverRef,
