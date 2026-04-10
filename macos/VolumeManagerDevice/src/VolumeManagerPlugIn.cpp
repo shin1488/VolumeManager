@@ -41,6 +41,23 @@
 #define kDevice_SampleRate        48000.0
 #define kDevice_RingBufferSize    16384
 #define kDevice_NumChannels       2
+#define kMaxClients               64
+
+// Custom property selectors for per-app volume.
+// 'VMcl' = list of clients as array of {pid, clientID, volume, muted}.
+// 'VMsv' = set volume: qualifier is {pid(4B), volume(4B float)}.
+// 'VMsm' = set mute:   qualifier is {pid(4B), muted(4B UInt32)}.
+#define kVMProp_ClientList   'VMcl'
+#define kVMProp_SetVolume    'VMsv'
+#define kVMProp_SetMute      'VMsm'
+
+// Per-client info struct. Returned by kVMProp_ClientList.
+struct VMClientInfo {
+    pid_t    pid;
+    UInt32   clientID;
+    Float32  volume;   // 0.0 – 1.0
+    UInt32   muted;    // 0 or 1
+};
 
 // Stable object IDs. 1 is always the plug-in object itself.
 enum {
@@ -73,6 +90,29 @@ static Float64                           gAnchorHostTime    = 0;
 static Float32                           gMasterVolume      = 1.0f;
 static bool                              gMasterMute        = false;
 static UInt32                            gIOIsRunning       = 0;
+
+// Per-client (per-app) volume state. Protected by gStateLock.
+struct ClientEntry {
+    bool     active;
+    UInt32   clientID;
+    pid_t    pid;
+    Float32  volume;   // 0.0 – 1.0, default 1.0
+    bool     muted;    // default false
+};
+static ClientEntry gClients[kMaxClients] = {};
+
+static ClientEntry* FindClientByID(UInt32 clientID) {
+    for (int i = 0; i < kMaxClients; ++i)
+        if (gClients[i].active && gClients[i].clientID == clientID)
+            return &gClients[i];
+    return nullptr;
+}
+static ClientEntry* FindClientByPID(pid_t pid) {
+    for (int i = 0; i < kMaxClients; ++i)
+        if (gClients[i].active && gClients[i].pid == pid)
+            return &gClients[i];
+    return nullptr;
+}
 
 // Loopback ring buffer: WriteMix writes the mixed output here, ReadInput
 // reads it back so a user-space helper can tap the device as an input
@@ -148,12 +188,37 @@ static OSStatus VolumeManager_DestroyDevice(AudioServerPlugInDriverRef, AudioObj
 
 static OSStatus VolumeManager_AddDeviceClient(AudioServerPlugInDriverRef,
                                               AudioObjectID,
-                                              const AudioServerPlugInClientInfo*) {
+                                              const AudioServerPlugInClientInfo* inClientInfo) {
+    if (!inClientInfo) return noErr;
+    pthread_mutex_lock(&gStateLock);
+    // Find a free slot.
+    for (int i = 0; i < kMaxClients; ++i) {
+        if (!gClients[i].active) {
+            gClients[i].active   = true;
+            gClients[i].clientID = inClientInfo->mClientID;
+            gClients[i].pid      = inClientInfo->mProcessID;
+            gClients[i].volume   = 1.0f;
+            gClients[i].muted    = false;
+            os_log(gLog, "VolumeManagerDevice: +client id=%u pid=%d",
+                   inClientInfo->mClientID, inClientInfo->mProcessID);
+            break;
+        }
+    }
+    pthread_mutex_unlock(&gStateLock);
     return noErr;
 }
 static OSStatus VolumeManager_RemoveDeviceClient(AudioServerPlugInDriverRef,
                                                  AudioObjectID,
-                                                 const AudioServerPlugInClientInfo*) {
+                                                 const AudioServerPlugInClientInfo* inClientInfo) {
+    if (!inClientInfo) return noErr;
+    pthread_mutex_lock(&gStateLock);
+    ClientEntry* c = FindClientByID(inClientInfo->mClientID);
+    if (c) {
+        os_log(gLog, "VolumeManagerDevice: -client id=%u pid=%d",
+               c->clientID, c->pid);
+        c->active = false;
+    }
+    pthread_mutex_unlock(&gStateLock);
     return noErr;
 }
 static OSStatus VolumeManager_PerformDeviceConfigurationChange(AudioServerPlugInDriverRef,
@@ -205,6 +270,10 @@ static Boolean VolumeManager_HasProperty(AudioServerPlugInDriverRef,
         case kAudioDevicePropertyDeviceCanBeDefaultSystemDevice:
         case kAudioDevicePropertyLatency:
         case kAudioDevicePropertyStreams:
+        // Custom per-app volume properties.
+        case kVMProp_ClientList:
+        case kVMProp_SetVolume:
+        case kVMProp_SetMute:
         case kAudioDevicePropertySafetyOffset:
         case kAudioDevicePropertyNominalSampleRate:
         case kAudioDevicePropertyAvailableNominalSampleRates:
@@ -289,6 +358,12 @@ static OSStatus VolumeManager_IsPropertySettable(AudioServerPlugInDriverRef,
             *outIsSettable = true;
         }
         break;
+    case kObjectID_Device:
+        if (inAddress->mSelector == kVMProp_SetVolume ||
+            inAddress->mSelector == kVMProp_SetMute) {
+            *outIsSettable = true;
+        }
+        break;
     default:
         break;
     }
@@ -363,6 +438,17 @@ static OSStatus VolumeManager_GetPropertyDataSize(AudioServerPlugInDriverRef,
         case kAudioDevicePropertyRelatedDevices:         *outDataSize = sizeof(AudioObjectID); return noErr;
         case kAudioDevicePropertyAvailableNominalSampleRates: *outDataSize = sizeof(AudioValueRange); return noErr;
         case kAudioDevicePropertyPreferredChannelsForStereo:  *outDataSize = 2 * sizeof(UInt32); return noErr;
+        case kVMProp_ClientList: {
+            // Count active clients.
+            pthread_mutex_lock(&gStateLock);
+            UInt32 n = 0;
+            for (int i = 0; i < kMaxClients; ++i) if (gClients[i].active) ++n;
+            pthread_mutex_unlock(&gStateLock);
+            *outDataSize = n * sizeof(VMClientInfo);
+            return noErr;
+        }
+        case kVMProp_SetVolume:  *outDataSize = 0; return noErr;
+        case kVMProp_SetMute:    *outDataSize = 0; return noErr;
         }
         break;
 
@@ -594,6 +680,25 @@ static OSStatus VolumeManager_GetPropertyData(AudioServerPlugInDriverRef,
             *outDataSize = 2 * sizeof(UInt32);
             return noErr;
         }
+        case kVMProp_ClientList: {
+            // Return array of VMClientInfo for each active client.
+            pthread_mutex_lock(&gStateLock);
+            VMClientInfo* out = (VMClientInfo*)outData;
+            UInt32 maxEntries = inDataSize / sizeof(VMClientInfo);
+            UInt32 written = 0;
+            for (int i = 0; i < kMaxClients && written < maxEntries; ++i) {
+                if (gClients[i].active) {
+                    out[written].pid      = gClients[i].pid;
+                    out[written].clientID = gClients[i].clientID;
+                    out[written].volume   = gClients[i].volume;
+                    out[written].muted    = gClients[i].muted ? 1 : 0;
+                    ++written;
+                }
+            }
+            pthread_mutex_unlock(&gStateLock);
+            *outDataSize = written * sizeof(VMClientInfo);
+            return noErr;
+        }
         }
         break;
 
@@ -808,6 +913,39 @@ static OSStatus VolumeManager_SetPropertyData(AudioServerPlugInDriverRef,
             return noErr;
         }
         break;
+
+    case kObjectID_Device:
+        // kVMProp_SetVolume: inData = { pid_t pid, Float32 volume }
+        if (inAddress->mSelector == kVMProp_SetVolume) {
+            if (inDataSize < sizeof(pid_t) + sizeof(Float32))
+                return kAudioHardwareBadPropertySizeError;
+            pid_t pid  = *(const pid_t*)inData;
+            Float32 vol = *(const Float32*)((const char*)inData + sizeof(pid_t));
+            if (vol < 0.0f) vol = 0.0f;
+            if (vol > 1.0f) vol = 1.0f;
+            pthread_mutex_lock(&gStateLock);
+            ClientEntry* c = FindClientByPID(pid);
+            if (c) c->volume = vol;
+            pthread_mutex_unlock(&gStateLock);
+            os_log(gLog, "VolumeManagerDevice: SetVolume pid=%d vol=%.2f %s",
+                   pid, vol, c ? "OK" : "NOT_FOUND");
+            return noErr;
+        }
+        // kVMProp_SetMute: inData = { pid_t pid, UInt32 muted }
+        if (inAddress->mSelector == kVMProp_SetMute) {
+            if (inDataSize < sizeof(pid_t) + sizeof(UInt32))
+                return kAudioHardwareBadPropertySizeError;
+            pid_t pid    = *(const pid_t*)inData;
+            UInt32 muted = *(const UInt32*)((const char*)inData + sizeof(pid_t));
+            pthread_mutex_lock(&gStateLock);
+            ClientEntry* c = FindClientByPID(pid);
+            if (c) c->muted = (muted != 0);
+            pthread_mutex_unlock(&gStateLock);
+            os_log(gLog, "VolumeManagerDevice: SetMute pid=%d mute=%u %s",
+                   pid, muted, c ? "OK" : "NOT_FOUND");
+            return noErr;
+        }
+        break;
     }
     return kAudioHardwareUnknownPropertyError;
 }
@@ -856,8 +994,9 @@ static OSStatus VolumeManager_WillDoIOOperation(AudioServerPlugInDriverRef,
                                                 UInt32 inOperationID,
                                                 Boolean* outWillDo,
                                                 Boolean* outWillDoInPlace) {
-    bool doOp = (inOperationID == kAudioServerPlugInIOOperationWriteMix) ||
-                (inOperationID == kAudioServerPlugInIOOperationReadInput);
+    bool doOp = (inOperationID == kAudioServerPlugInIOOperationWriteMix)    ||
+                (inOperationID == kAudioServerPlugInIOOperationReadInput)   ||
+                (inOperationID == kAudioServerPlugInIOOperationProcessOutput);
     if (outWillDo)        *outWillDo        = doOp;
     if (outWillDoInPlace) *outWillDoInPlace = true;
     return noErr;
@@ -868,12 +1007,31 @@ static OSStatus VolumeManager_BeginIOOperation(AudioServerPlugInDriverRef,
     return noErr;
 }
 static OSStatus VolumeManager_DoIOOperation(AudioServerPlugInDriverRef,
-                                            AudioObjectID, AudioObjectID, UInt32,
+                                            AudioObjectID, AudioObjectID,
+                                            UInt32 inClientID,
                                             UInt32 inOperationID,
                                             UInt32 inIOBufferFrameSize,
                                             const AudioServerPlugInIOCycleInfo* inIOCycleInfo,
                                             void* ioMainBuffer, void*) {
     if (!ioMainBuffer || !inIOCycleInfo) return noErr;
+
+    if (inOperationID == kAudioServerPlugInIOOperationProcessOutput) {
+        // Called per-client BEFORE the mix. Apply per-app gain here.
+        pthread_mutex_lock(&gStateLock);
+        Float32 gain = 1.0f;
+        ClientEntry* c = FindClientByID(inClientID);
+        if (c) {
+            gain = c->muted ? 0.0f : c->volume;
+        }
+        pthread_mutex_unlock(&gStateLock);
+
+        if (gain != 1.0f) {
+            Float32* samples = (Float32*)ioMainBuffer;
+            UInt32 n = inIOBufferFrameSize * kDevice_NumChannels;
+            for (UInt32 i = 0; i < n; ++i) samples[i] *= gain;
+        }
+        return noErr;
+    }
 
     if (inOperationID == kAudioServerPlugInIOOperationWriteMix) {
         // Apply master gain/mute, then copy the mixed buffer into our
@@ -891,16 +1049,13 @@ static OSStatus VolumeManager_DoIOOperation(AudioServerPlugInDriverRef,
             for (UInt32 c = 0; c < kDevice_NumChannels; ++c) {
                 Float32 s = src[i * kDevice_NumChannels + c] * gain;
                 dst[c] = s;
-                src[i * kDevice_NumChannels + c] = s; // keep in-place too
+                src[i * kDevice_NumChannels + c] = s;
             }
         }
         return noErr;
     }
 
     if (inOperationID == kAudioServerPlugInIOOperationReadInput) {
-        // Serve the loopback: copy from the ring buffer into the
-        // caller's input buffer, using the input sample time. The HAL
-        // naturally reads a bit behind where WriteMix just wrote.
         Float32* dst = (Float32*)ioMainBuffer;
         UInt64 startFrame = (UInt64)inIOCycleInfo->mInputTime.mSampleTime;
         for (UInt32 i = 0; i < inIOBufferFrameSize; ++i) {

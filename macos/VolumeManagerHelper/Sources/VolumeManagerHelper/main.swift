@@ -9,8 +9,10 @@
 // Also hosts the JSON-over-stdio control bridge for the Kotlin UI
 // (per-app volume stubs).
 
+import AppKit      // NSRunningApplication
 import AudioToolbox
 import CoreAudio
+import Darwin      // proc_name
 import Foundation
 
 // MARK: - Wire format ---------------------------------------------------------
@@ -338,9 +340,103 @@ func emit(_ event: Event) {
     FileHandle.standardOutput.write(Data((line + "\n").utf8))
 }
 
+// MARK: - Driver custom property bridge ---------------------------------------
+
+// Must match the FourCC selectors in VolumeManagerPlugIn.cpp.
+let kVMProp_ClientList: AudioObjectPropertySelector = 0x564D636C  // 'VMcl'
+let kVMProp_SetVolume:  AudioObjectPropertySelector = 0x564D7376  // 'VMsv'
+let kVMProp_SetMute:    AudioObjectPropertySelector = 0x564D736D  // 'VMsm'
+
+// Matches the C struct VMClientInfo in the driver.
+struct VMClientInfo {
+    var pid:      Int32
+    var clientID: UInt32
+    var volume:   Float32
+    var muted:    UInt32
+}
+
+enum DriverBridge {
+    /// Read the current client list from the driver via kVMProp_ClientList.
+    static func listClients(deviceID: AudioDeviceID) -> [Session] {
+        var addr = AudioObjectPropertyAddress(
+            mSelector: kVMProp_ClientList,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
+
+        // First query size.
+        var size: UInt32 = 0
+        var err = AudioObjectGetPropertyDataSize(deviceID, &addr, 0, nil, &size)
+        guard err == noErr, size > 0 else { return [] }
+
+        let count = Int(size) / MemoryLayout<VMClientInfo>.size
+        var buf = [VMClientInfo](repeating: VMClientInfo(pid: 0, clientID: 0, volume: 1, muted: 0),
+                                 count: count)
+        err = buf.withUnsafeMutableBytes { ptr -> OSStatus in
+            var sz = size
+            return AudioObjectGetPropertyData(deviceID, &addr, 0, nil, &sz, ptr.baseAddress!)
+        }
+        guard err == noErr else { return [] }
+
+        return buf.map { info in
+            // Try to get the process name.
+            let name = ProcessInfo.processInfo.processName  // fallback
+            let actualName = DriverBridge.processName(pid: info.pid) ?? "pid:\(info.pid)"
+            return Session(pid: info.pid, name: actualName,
+                           volume: Double(info.volume), muted: info.muted != 0)
+        }
+    }
+
+    /// Set per-app volume via kVMProp_SetVolume.
+    static func setVolume(deviceID: AudioDeviceID, pid: Int32, volume: Float) {
+        var addr = AudioObjectPropertyAddress(
+            mSelector: kVMProp_SetVolume,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
+        // Payload: { pid_t, Float32 }
+        var payload = (pid, volume)
+        let size = UInt32(MemoryLayout.size(ofValue: payload))
+        withUnsafePointer(to: &payload) { ptr in
+            AudioObjectSetPropertyData(deviceID, &addr, 0, nil, size,
+                                       UnsafeRawPointer(ptr))
+        }
+    }
+
+    /// Set per-app mute via kVMProp_SetMute.
+    static func setMute(deviceID: AudioDeviceID, pid: Int32, muted: Bool) {
+        var addr = AudioObjectPropertyAddress(
+            mSelector: kVMProp_SetMute,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
+        var payload: (Int32, UInt32) = (pid, muted ? 1 : 0)
+        let size = UInt32(MemoryLayout.size(ofValue: payload))
+        withUnsafePointer(to: &payload) { ptr in
+            AudioObjectSetPropertyData(deviceID, &addr, 0, nil, size,
+                                       UnsafeRawPointer(ptr))
+        }
+    }
+
+    /// Get process name from pid via NSRunningApplication or proc_name.
+    static func processName(pid: Int32) -> String? {
+        // Try NSWorkspace first (more readable names).
+        if let app = NSRunningApplication(processIdentifier: pid) {
+            return app.localizedName
+        }
+        // Fallback: proc_name via C.
+        var name = [CChar](repeating: 0, count: 256)
+        proc_name(pid, &name, 256)
+        let s = String(cString: name)
+        return s.isEmpty ? nil : s
+    }
+}
+
+// MARK: - Main ----------------------------------------------------------------
+
 let forwarder = AudioForwarder()
 forwarder.start()
 emit(Event(type: "status", sessions: nil, message: "forwarder started"))
+
+// Resolve device ID once for property queries.
+let vmDeviceID = HAL.device(byUID: kVolumeManagerDeviceUID) ?? AudioDeviceID(kAudioObjectUnknown)
 
 while let line = readLine() {
     guard let data = line.data(using: .utf8),
@@ -351,9 +447,24 @@ while let line = readLine() {
 
     switch cmd.op {
     case "list":
-        emit(Event(type: "sessions", sessions: [], message: nil))
-    case "setVolume", "setMute", "subscribe":
+        let sessions = DriverBridge.listClients(deviceID: vmDeviceID)
+        emit(Event(type: "sessions", sessions: sessions, message: nil))
+
+    case "setVolume":
+        if let pid = cmd.pid, let v = cmd.value {
+            DriverBridge.setVolume(deviceID: vmDeviceID, pid: pid, volume: Float(v))
+        }
+
+    case "setMute":
+        if let pid = cmd.pid, let v = cmd.value {
+            DriverBridge.setMute(deviceID: vmDeviceID, pid: pid, muted: v != 0)
+        }
+
+    case "subscribe":
+        // TODO: register AudioObjectPropertyListener on kVMProp_ClientList
+        // and emit sessions events on change.
         break
+
     default:
         emit(Event(type: "error", sessions: nil, message: "unknown op: \(cmd.op)"))
     }
