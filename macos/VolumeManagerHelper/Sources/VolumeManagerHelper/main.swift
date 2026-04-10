@@ -94,41 +94,41 @@ enum HAL {
 
 // MARK: - TPCircularBuffer-style ring buffer ----------------------------------
 
-/// Simple lock-free SPSC ring buffer for Float32 samples.
+/// Simple SPSC ring buffer for Float32 samples. Uses monotonic
+/// 64-bit counters (no wrap — overflow in ~3 million years at 48kHz).
 final class RingBuffer {
     private let buf: UnsafeMutablePointer<Float>
-    private let capacity: Int  // total Float count
-    private var wHead: Int = 0
-    private var rHead: Int = 0
+    private let cap: Int
+    private var w: Int = 0   // monotonic write position (in floats)
+    private var r: Int = 0   // monotonic read position (in floats)
 
     init(floatCapacity: Int) {
-        capacity = floatCapacity
+        cap = floatCapacity
         buf = .allocate(capacity: floatCapacity)
         buf.initialize(repeating: 0, count: floatCapacity)
     }
     deinit { buf.deallocate() }
 
-    var available: Int {
-        let a = wHead - rHead
-        return a >= 0 ? a : a + capacity
-    }
+    var available: Int { w - r }
 
     func write(_ src: UnsafePointer<Float>, count: Int) {
         for i in 0..<count {
-            buf[wHead % capacity] = src[i]
-            wHead = (wHead &+ 1) % (capacity * 2)  // wrap at 2x
+            buf[(w + i) % cap] = src[i]
         }
+        w += count
     }
 
     func read(into dst: UnsafeMutablePointer<Float>, count: Int) {
+        // If writer is way ahead, skip forward to stay close.
+        if available > cap { r = w - cap / 2 }
         for i in 0..<count {
-            if available > 0 {
-                dst[i] = buf[rHead % capacity]
-                rHead = (rHead &+ 1) % (capacity * 2)
+            if r + i < w {
+                dst[i] = buf[(r + i) % cap]
             } else {
                 dst[i] = 0  // underrun → silence
             }
         }
+        r += count
     }
 }
 
@@ -259,10 +259,11 @@ final class AudioForwarder {
                              kAudioUnitScope_Global, 0,
                              &outDev, UInt32(MemoryLayout<AudioDeviceID>.size))
 
-        // Set format on the input side of the playback unit
-        // (what we supply in the render callback).
-        var outAsbd = asbd
-        outAsbd.mSampleRate = outRate  // match playback device rate
+        // Set format on the input side of the playback unit.
+        // Use capRate (not outRate!) because our ring buffer data
+        // comes from the capture unit at capRate. The AUHAL will
+        // internally sample-rate-convert capRate → outRate.
+        var outAsbd = asbd  // already at capRate
         AudioUnitSetProperty(outUnit, kAudioUnitProperty_StreamFormat,
                              kAudioUnitScope_Input, 0,
                              &outAsbd, UInt32(MemoryLayout<AudioStreamBasicDescription>.size))
