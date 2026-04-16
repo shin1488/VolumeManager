@@ -56,7 +56,12 @@ fun ApplicationScope.AppRoot(
         resizable = false,
     ) {
         // Snap-to-corner + panel-side selection driven by main window position.
+        // Pass the AWT window so WindowSnap can read its actual
+        // graphicsConfiguration — needed for both DPI-correct math (Compose
+        // dp values map 1:1 to AWT user-space pixels, no density multiplier)
+        // and to honor whichever monitor the user has dragged us to.
         WindowSnap(
+            awtWindow = window,
             windowState = mainWindowState,
             onPanelOnLeftChange = {
                 viewModel.handle(VolumeManagerIntent.SetPanelOnLeft(it))

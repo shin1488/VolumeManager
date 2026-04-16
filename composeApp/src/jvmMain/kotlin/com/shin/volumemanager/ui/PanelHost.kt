@@ -21,7 +21,6 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.awt.AwtWindow
 import androidx.compose.ui.awt.ComposeDialog
-import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.FrameWindowScope
@@ -62,7 +61,6 @@ fun FrameWindowScope.PanelHost(
     val pc = state.panelContent ?: return
     val mainPos = mainWindowState.position as? WindowPosition.Absolute ?: return
 
-    val density = LocalDensity.current
     val parentWindow = window
 
     // Compute initial position ONCE on mount so the dialog appears at the
@@ -119,10 +117,19 @@ fun FrameWindowScope.PanelHost(
                 // Position and size the JDialog directly so the first frame
                 // appears in the right place — Compose's WindowState would
                 // have to wait for an UpdateEffect cycle.
-                val px = (initialPosition.x.value * density.density).toInt()
-                val py = (initialPosition.y.value * density.density).toInt()
-                val pw = (PANEL_W.value * density.density).toInt()
-                val ph = (PANEL_H.value * density.density).toInt()
+                //
+                // AWT setBounds uses user-space pixels (the JVM does the
+                // Windows DPI scaling for us). Compose Desktop stores
+                // WindowState position/size in dp values that are *also*
+                // user-space pixels — see SwingWindow.desktop.kt where the
+                // round-trip is `WindowPosition(awt.x.dp, awt.y.dp)`. So we
+                // pass Dp.value straight through; multiplying by
+                // LocalDensity.density would double-scale on any HiDPI
+                // display and place the panel hundreds of pixels off.
+                val px = initialPosition.x.value.toInt()
+                val py = initialPosition.y.value.toInt()
+                val pw = PANEL_W.value.toInt()
+                val ph = PANEL_H.value.toInt()
                 setBounds(px, py, pw, ph)
 
                 setContent {
@@ -182,8 +189,10 @@ fun FrameWindowScope.PanelHost(
             val pxDp = if (state.panelOnLeft) absPos.x - PANEL_W - PANEL_GAP
                        else                    absPos.x + COLLAPSED_W + PANEL_GAP
             val pyDp = absPos.y + py
-            val sx = (pxDp.value * density.density).toInt()
-            val sy = (pyDp.value * density.density).toInt()
+            // Same user-space-pixel reasoning as in `create`: dp.value goes
+            // directly to AWT setLocation, no density scaling.
+            val sx = pxDp.value.toInt()
+            val sy = pyDp.value.toInt()
             if (dialog.x != sx || dialog.y != sy) {
                 dialog.setLocation(sx, sy)
             }
