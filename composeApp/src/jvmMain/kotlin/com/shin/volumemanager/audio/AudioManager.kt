@@ -12,6 +12,8 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import java.io.File
+import java.util.concurrent.ConcurrentHashMap
+import kotlin.math.abs
 
 /**
  * Polls the Windows Core Audio session list once per second and exposes the
@@ -45,6 +47,28 @@ class AudioManager {
     // underlying pid that belongs to the same app group. A volume command
     // on the representative fans out to all of these.
     private val groupMembers = mutableMapOf<Int, List<Int>>()
+
+    /**
+     * Pending user-initiated changes, keyed by representative pid. While an
+     * entry is present, [groupSessions] overlays the pending value over what
+     * the OS reports — so a poll that snapshotted before a setMute / setVolume
+     * COM call can't transiently revert the UI to the pre-call state. The
+     * entry is cleared as soon as the OS-observed value catches up to the
+     * pending value (or after [PENDING_TTL_MS] as a safety net for sessions
+     * that died mid-change).
+     *
+     * Without this overlay, two rapid mute clicks could land in a tiny
+     * window where the first click's setMute was queued behind a refresh:
+     * the refresh would emit the pre-mute snapshot, ViewModel would revert
+     * the optimistic state, then the second click would read the reverted
+     * value and toggle in the same direction as the first — a stuck mute
+     * button that needs a third click to recover. Pending overlay closes
+     * that window.
+     */
+    private val pendingMute = ConcurrentHashMap<Int, PendingChange<Boolean>>()
+    private val pendingVolume = ConcurrentHashMap<Int, PendingChange<Float>>()
+
+    private data class PendingChange<T>(val value: T, val deadline: Long)
 
     init {
         scope.launch {
@@ -236,20 +260,62 @@ class AudioManager {
                 }
             }
 
+            // Apply pending overlay so a refresh that snapshotted before
+            // the user's setMute/setVolume COM call doesn't transiently
+            // emit the pre-call value. Pending entries clear themselves
+            // here once the OS-observed value catches up, or after the
+            // TTL elapses (in case the session died mid-change).
+            val now = System.currentTimeMillis()
+            val effectiveMuted = resolvePending(
+                pending = pendingMute,
+                key = rep,
+                observed = head.isMuted,
+                now = now,
+                matches = { a, b -> a == b },
+            )
+            val effectiveVolume = resolvePending(
+                pending = pendingVolume,
+                key = rep,
+                observed = head.volume,
+                now = now,
+                // Volume comes back from the OS quantized to a step the
+                // mixer can express, so accept "close enough" as a match.
+                matches = { a, b -> abs(a - b) < 0.005f },
+            )
+
             AudioSession(
                 pid = rep,
                 displayName = head.displayName,
                 icon = icon,
-                volume = head.volume,
-                isMuted = head.isMuted,
+                volume = effectiveVolume,
+                isMuted = effectiveMuted,
             )
         }
     }
 
+    private fun <T> resolvePending(
+        pending: ConcurrentHashMap<Int, PendingChange<T>>,
+        key: Int,
+        observed: T,
+        now: Long,
+        matches: (T, T) -> Boolean,
+    ): T {
+        val p = pending[key] ?: return observed
+        return when {
+            now > p.deadline -> { pending.remove(key); observed }
+            matches(observed, p.value) -> { pending.remove(key); observed }
+            else -> p.value
+        }
+    }
+
     fun setVolume(pid: Int, volume: Float) {
+        val level = volume.coerceIn(0f, 1f)
+        // Record BEFORE launching so any refresh that's already in flight
+        // (running on the same comDispatcher, ahead of our coroutine in
+        // the queue) sees the pending value when it gets to groupSessions.
+        pendingVolume[pid] = PendingChange(level, System.currentTimeMillis() + PENDING_TTL_MS)
         scope.launch {
             try {
-                val level = volume.coerceIn(0f, 1f)
                 // Fan out to every PID in the group so grouped sessions
                 // move in lockstep. Falls back to the single PID if this
                 // one isn't a group representative.
@@ -257,10 +323,9 @@ class AudioManager {
                 for (p in targets) {
                     volumeControls[p]?.setMasterVolume(level)
                 }
-                // Reflect into the StateFlow right away. Without this, a
-                // refresh that snapshotted just before the COM call would
-                // emit and the ViewModel would briefly revert to the old
-                // value before the next refresh re-confirmed.
+                // Mirror into _sessions so observers see the change before
+                // the next poll. The pending overlay still owns the truth
+                // until the OS-observed value catches up.
                 _sessions.value = _sessions.value.map {
                     if (it.pid == pid) it.copy(volume = level) else it
                 }
@@ -271,6 +336,7 @@ class AudioManager {
     }
 
     fun setMute(pid: Int, muted: Boolean) {
+        pendingMute[pid] = PendingChange(muted, System.currentTimeMillis() + PENDING_TTL_MS)
         scope.launch {
             try {
                 val targets = groupMembers[pid] ?: listOf(pid)
@@ -284,6 +350,15 @@ class AudioManager {
                 e.printStackTrace()
             }
         }
+    }
+
+    private companion object {
+        // How long a pending user change overrides the OS-observed value
+        // before we give up and accept what the OS reports. Long enough
+        // to cover any plausible COM round-trip + a couple of poll cycles
+        // (so the second poll after setMute can confirm), short enough
+        // that a session that died mid-change doesn't freeze its row.
+        private const val PENDING_TTL_MS = 3000L
     }
 
     private fun releaseVolumeControls() {
