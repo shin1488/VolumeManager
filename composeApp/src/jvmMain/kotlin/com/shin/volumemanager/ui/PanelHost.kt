@@ -101,7 +101,18 @@ fun FrameWindowScope.PanelHost(
                 // (before pack()/setVisible). After addNotify() these flags
                 // either no-op or throw on Windows. This is the whole reason
                 // we can't use the DialogWindow composable.
-                focusableWindowState = false
+                //
+                // focusableWindowState stays at the default (true) because
+                // the panel hosts a BasicTextField (the volume number input)
+                // that needs keyboard focus to receive typing — a fully
+                // non-focusable window swallows all keystrokes silently.
+                //
+                // isAutoRequestFocus = false keeps the panel from stealing
+                // focus when it first appears, so opening it doesn't kill
+                // mouse input on the icon column. The user has to actively
+                // click *into* the panel to give it keyboard focus, at
+                // which point AppRoot's smart focus listener tolerates the
+                // main↔panel transition (see windowLostFocus there).
                 isAutoRequestFocus = false
                 type = java.awt.Window.Type.UTILITY
 
@@ -131,6 +142,26 @@ fun FrameWindowScope.PanelHost(
                 val pw = PANEL_W.value.toInt()
                 val ph = PANEL_H.value.toInt()
                 setBounds(px, py, pw, ph)
+
+                // When the panel itself loses focus (e.g. user clicks the
+                // taskbar or another app while a number-input field was
+                // active), check if the new focus owner is still inside our
+                // app — main window or any window owned by it. If not,
+                // close the panel. We defer with invokeLater so the focus
+                // transition has time to settle (the new focused window is
+                // null at the moment the lost event fires).
+                addWindowFocusListener(object : java.awt.event.WindowFocusListener {
+                    override fun windowGainedFocus(e: java.awt.event.WindowEvent?) = Unit
+                    override fun windowLostFocus(e: java.awt.event.WindowEvent?) {
+                        javax.swing.SwingUtilities.invokeLater {
+                            val focused = java.awt.KeyboardFocusManager
+                                .getCurrentKeyboardFocusManager().focusedWindow
+                            if (focused == parentWindow) return@invokeLater
+                            if (focused?.owner == parentWindow) return@invokeLater
+                            contentHolder.value.onIntent(VolumeManagerIntent.SelectPanel(null))
+                        }
+                    }
+                })
 
                 setContent {
                     val inputs = contentHolder.value

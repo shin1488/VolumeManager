@@ -68,16 +68,30 @@ fun ApplicationScope.AppRoot(
             },
         )
 
-        // Close the side panel as soon as focus leaves the main window.
-        // The panel dialog is explicitly non-focusable (AWT
-        // focusableWindowState = false) so clicking it does NOT cause the
-        // main window to lose focus — which means a real focus-lost event
-        // means the user clicked elsewhere, and the panel should go away.
+        // Close the side panel when focus leaves the *app entirely* — but
+        // tolerate the focus hop the user makes when they click into the
+        // panel to type a volume number. The panel is now focusable (so its
+        // text field can receive keystrokes), so a click on the panel will
+        // cause the main window to lose focus to it; that's not a "user
+        // clicked elsewhere" signal, it's the panel becoming active.
+        //
+        // We defer the check with invokeLater because at the moment
+        // windowLostFocus fires, the new focused window can still be null —
+        // the AWT focus manager hasn't published the transition yet.
         DisposableEffect(Unit) {
             val listener = object : WindowFocusListener {
                 override fun windowGainedFocus(e: WindowEvent?) = Unit
                 override fun windowLostFocus(e: WindowEvent?) {
-                    viewModel.handle(VolumeManagerIntent.SelectPanel(null))
+                    javax.swing.SwingUtilities.invokeLater {
+                        val focused = java.awt.KeyboardFocusManager
+                            .getCurrentKeyboardFocusManager().focusedWindow
+                        // Focus is still inside our app if it landed on the
+                        // main window or any of its owned dialogs (the side
+                        // panel, today; future popups too).
+                        if (focused == window) return@invokeLater
+                        if (focused?.owner == window) return@invokeLater
+                        viewModel.handle(VolumeManagerIntent.SelectPanel(null))
+                    }
                 }
             }
             window.addWindowFocusListener(listener)
