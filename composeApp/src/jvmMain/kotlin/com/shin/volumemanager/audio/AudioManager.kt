@@ -56,7 +56,12 @@ class AudioManager {
                     } catch (e: Exception) {
                         e.printStackTrace()
                     }
-                    delay(1000)
+                    // 250 ms balances responsiveness to external volume
+                    // changes (media keys, other mixers) against COM /
+                    // CPU cost. User-initiated changes don't wait for a
+                    // poll — setVolume / setMute write into _sessions
+                    // immediately after their COM call returns.
+                    delay(250)
                 }
             } finally {
                 releaseVolumeControls()
@@ -252,6 +257,13 @@ class AudioManager {
                 for (p in targets) {
                     volumeControls[p]?.setMasterVolume(level)
                 }
+                // Reflect into the StateFlow right away. Without this, a
+                // refresh that snapshotted just before the COM call would
+                // emit and the ViewModel would briefly revert to the old
+                // value before the next refresh re-confirmed.
+                _sessions.value = _sessions.value.map {
+                    if (it.pid == pid) it.copy(volume = level) else it
+                }
             } catch (e: Exception) {
                 e.printStackTrace()
             }
@@ -264,6 +276,9 @@ class AudioManager {
                 val targets = groupMembers[pid] ?: listOf(pid)
                 for (p in targets) {
                     volumeControls[p]?.setMute(muted)
+                }
+                _sessions.value = _sessions.value.map {
+                    if (it.pid == pid) it.copy(isMuted = muted) else it
                 }
             } catch (e: Exception) {
                 e.printStackTrace()

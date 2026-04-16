@@ -49,12 +49,36 @@ class VolumeManagerViewModel(
             is VolumeManagerIntent.SelectPanel ->
                 _state.update { it.copy(panelContent = intent.content) }
 
-            is VolumeManagerIntent.SetVolume ->
-                audioManager.setVolume(intent.pid, intent.volume)
+            is VolumeManagerIntent.SetVolume -> {
+                // Optimistically reflect the new volume in state so any UI
+                // bound to session.volume (sliders that don't track local
+                // state, future indicators, etc.) updates this frame instead
+                // of waiting up to a full poll cycle for AudioManager to
+                // re-emit. The poll will reconcile with the OS-reported
+                // value if the SetMasterVolume call rounded or clamped.
+                val v = intent.volume.coerceIn(0f, 1f)
+                _state.update { s ->
+                    s.copy(sessions = s.sessions.map {
+                        if (it.pid == intent.pid) it.copy(volume = v) else it
+                    })
+                }
+                audioManager.setVolume(intent.pid, v)
+            }
 
             is VolumeManagerIntent.ToggleMute -> {
                 val s = _state.value.sessions.find { it.pid == intent.pid } ?: return
-                audioManager.setMute(intent.pid, !s.isMuted)
+                val newMute = !s.isMuted
+                // Optimistic flip so the speaker icon, the dimmed app
+                // icon in the column, and the slider's enabled state all
+                // change on this frame. Without this the user clicks mute
+                // and waits ~½s (avg poll latency) for any visual feedback
+                // — feels broken even though the COM call already fired.
+                _state.update { st ->
+                    st.copy(sessions = st.sessions.map {
+                        if (it.pid == intent.pid) it.copy(isMuted = newMute) else it
+                    })
+                }
+                audioManager.setMute(intent.pid, newMute)
             }
 
             is VolumeManagerIntent.SetOpacity ->
