@@ -9,7 +9,6 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.filled.VolumeOff
 import androidx.compose.material.icons.automirrored.filled.VolumeUp
 import androidx.compose.material.icons.filled.MusicNote
 import androidx.compose.material3.Icon
@@ -60,13 +59,6 @@ fun SessionIconButton(
                 tint = if (session.isMuted)
                     MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.35f)
                 else MaterialTheme.colorScheme.onSurfaceVariant
-            )
-        }
-        if (session.isMuted) {
-            Icon(
-                Icons.AutoMirrored.Filled.VolumeOff, "Muted",
-                Modifier.size(11.dp).align(Alignment.BottomEnd),
-                tint = MaterialTheme.colorScheme.error
             )
         }
     }

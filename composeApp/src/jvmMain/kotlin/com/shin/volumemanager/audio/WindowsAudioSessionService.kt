@@ -15,9 +15,15 @@ import java.io.File
 
 /**
  * Windows implementation of [AudioSessionService] built on WASAPI's
- * `IAudioSessionManager2` via JNA. This is the original implementation the
- * app shipped with; only the class name and the `AudioSessionService`
- * interface wiring were added when macOS support was scaffolded.
+ * `IAudioSessionManager2` via JNA.
+ *
+ * **Grouping:** a single process (e.g. Chrome with several tabs playing
+ * audio) and even one-exe-many-instances scenarios (e.g. two Discord
+ * windows) create multiple underlying audio sessions. The UI should show
+ * *one icon per application*, not one per session, so sessions are grouped
+ * by their executable path (or the literal "SystemSounds" marker). Volume
+ * and mute commands on the representative [AudioSession.pid] fan out to
+ * every underlying PID in that group.
  */
 @OptIn(ExperimentalCoroutinesApi::class)
 class WindowsAudioSessionService : AudioSessionService {
@@ -27,8 +33,9 @@ class WindowsAudioSessionService : AudioSessionService {
     private val _sessions = MutableStateFlow<List<AudioSession>>(emptyList())
     override val sessions: StateFlow<List<AudioSession>> = _sessions.asStateFlow()
 
-    private val iconCache = mutableMapOf<Int, ImageBitmap?>()
+    private val iconCache = mutableMapOf<String, ImageBitmap?>()
     private val volumeControls = mutableMapOf<Int, SimpleAudioVolume>()
+    private val groupMembers = mutableMapOf<Int, List<Int>>()
 
     init {
         scope.launch {
@@ -51,6 +58,7 @@ class WindowsAudioSessionService : AudioSessionService {
 
     private fun refreshSessions() {
         releaseVolumeControls()
+        groupMembers.clear()
 
         val ppEnum = PointerByReference()
         val hr = Ole32.INSTANCE.CoCreateInstance(
@@ -72,14 +80,11 @@ class WindowsAudioSessionService : AudioSessionService {
                     val sessEnum = AudioSessionEnumerator(sessEnumPtr)
                     try {
                         val count = sessEnum.getCount()
-                        val seenPids = mutableSetOf<Int>()
-                        val newSessions = mutableListOf<AudioSession>()
-
+                        val raw = mutableListOf<RawSession>()
                         for (i in 0 until count) {
-                            processSession(sessEnum, i, seenPids, newSessions)
+                            collectSession(sessEnum, i, raw)
                         }
-
-                        _sessions.value = newSessions
+                        _sessions.value = groupSessions(raw)
                     } finally {
                         sessEnum.Release()
                     }
@@ -94,11 +99,19 @@ class WindowsAudioSessionService : AudioSessionService {
         }
     }
 
-    private fun processSession(
+    private data class RawSession(
+        val pid: Int,
+        val exePath: String?,
+        val displayName: String,
+        val isSystemSounds: Boolean,
+        val volume: Float,
+        val isMuted: Boolean,
+    )
+
+    private fun collectSession(
         sessEnum: AudioSessionEnumerator,
         index: Int,
-        seenPids: MutableSet<Int>,
-        result: MutableList<AudioSession>
+        out: MutableList<RawSession>,
     ) {
         val sessionPtr = try {
             sessEnum.getSession(index)
@@ -106,66 +119,99 @@ class WindowsAudioSessionService : AudioSessionService {
             return
         }
         val session = AudioSessionControl(sessionPtr)
-
         try {
             val state = session.getState()
-            if (state == 2) return // expired
+            if (state == 2) return
 
             val ctrl2Ptr = session.qi(IID_IAudioSessionControl2) ?: return
             val ctrl2 = AudioSessionControl2(ctrl2Ptr)
-            val pid = try {
-                ctrl2.getProcessId()
-            } catch (_: Exception) {
-                ctrl2.Release(); return
+            val isSystemSounds: Boolean
+            val pid: Int
+            try {
+                isSystemSounds = try { ctrl2.isSystemSounds() } catch (_: Exception) { false }
+                pid = try { ctrl2.getProcessId() } catch (_: Exception) { 0 }
+            } finally {
+                ctrl2.Release()
             }
-            ctrl2.Release()
-
-            if (pid in seenPids) return
-            if (pid == 0 && state != 1) return // skip inactive system sounds
-            seenPids.add(pid)
 
             val volPtr = session.qi(IID_ISimpleAudioVolume) ?: return
             val volumeControl = SimpleAudioVolume(volPtr)
             volumeControls[pid] = volumeControl
 
-            val volume = try {
-                volumeControl.getMasterVolume()
-            } catch (_: Exception) {
-                1f
-            }
-            val isMuted = try {
-                volumeControl.getMute()
-            } catch (_: Exception) {
-                false
-            }
+            val volume = try { volumeControl.getMasterVolume() } catch (_: Exception) { 1f }
+            val isMuted = try { volumeControl.getMute() } catch (_: Exception) { false }
 
+            val exePath = if (!isSystemSounds && pid > 0)
+                IconExtractor.getProcessExePath(pid) else null
             var displayName = session.getDisplayName()
-            val exePath = if (pid > 0) IconExtractor.getProcessExePath(pid) else null
             if (displayName.isNullOrEmpty()) {
-                displayName = exePath?.let { File(it).nameWithoutExtension } ?: "PID $pid"
+                displayName = exePath?.let { File(it).nameWithoutExtension }
+                    ?: if (isSystemSounds) "System Sounds" else "PID $pid"
             }
-            if (pid == 0) displayName = "System Sounds"
+            if (isSystemSounds) displayName = "System Sounds"
 
-            val icon = iconCache.getOrPut(pid) {
-                exePath?.let {
+            out.add(
+                RawSession(
+                    pid = pid,
+                    exePath = exePath,
+                    displayName = displayName,
+                    isSystemSounds = isSystemSounds,
+                    volume = volume,
+                    isMuted = isMuted,
+                )
+            )
+        } finally {
+            session.Release()
+        }
+    }
+
+    private fun groupSessions(raw: List<RawSession>): List<AudioSession> {
+        val groups = linkedMapOf<String, MutableList<RawSession>>()
+        for (s in raw) {
+            val key = when {
+                s.isSystemSounds -> "__system_sounds__"
+                !s.exePath.isNullOrEmpty() -> s.exePath.lowercase()
+                else -> "__pid_${s.pid}__"
+            }
+            groups.getOrPut(key) { mutableListOf() }.add(s)
+        }
+
+        val ordered = groups.values.sortedByDescending { it.first().isSystemSounds }
+
+        return ordered.map { members ->
+            val head = members.first()
+            val rep = if (head.isSystemSounds) 0 else head.pid
+            groupMembers[rep] = members.map { it.pid }
+
+            val icon = if (head.isSystemSounds) null
+            else head.exePath?.let { path ->
+                iconCache.getOrPut(path.lowercase()) {
                     try {
-                        IconExtractor.extractIcon(it)?.toComposeImageBitmap()
+                        IconExtractor.extractIcon(path)?.toComposeImageBitmap()
                     } catch (_: Exception) {
                         null
                     }
                 }
             }
 
-            result.add(AudioSession(pid, displayName, icon, volume, isMuted))
-        } finally {
-            session.Release()
+            AudioSession(
+                pid = rep,
+                displayName = head.displayName,
+                icon = icon,
+                volume = head.volume,
+                isMuted = head.isMuted,
+            )
         }
     }
 
     override fun setVolume(pid: Int, volume: Float) {
         scope.launch {
             try {
-                volumeControls[pid]?.setMasterVolume(volume.coerceIn(0f, 1f))
+                val level = volume.coerceIn(0f, 1f)
+                val targets = groupMembers[pid] ?: listOf(pid)
+                for (p in targets) {
+                    volumeControls[p]?.setMasterVolume(level)
+                }
             } catch (e: Exception) {
                 e.printStackTrace()
             }
@@ -175,7 +221,10 @@ class WindowsAudioSessionService : AudioSessionService {
     override fun setMute(pid: Int, muted: Boolean) {
         scope.launch {
             try {
-                volumeControls[pid]?.setMute(muted)
+                val targets = groupMembers[pid] ?: listOf(pid)
+                for (p in targets) {
+                    volumeControls[p]?.setMute(muted)
+                }
             } catch (e: Exception) {
                 e.printStackTrace()
             }

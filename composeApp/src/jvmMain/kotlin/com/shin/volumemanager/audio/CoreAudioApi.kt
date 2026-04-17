@@ -116,6 +116,18 @@ class AudioSessionControl2(p: Pointer?) : ComPtr(p) {
         COMUtils.checkRC(HRESULT(hr))
         return pid.value
     }
+
+    /**
+     * Canonical way to identify the Windows system-sounds session. Relying on
+     * `pid == 0` is unreliable: system notification sounds often play through
+     * the explorer.exe process, which would otherwise borrow explorer's icon
+     * and display name. `IsSystemSoundsSession` returns S_OK (0) when the
+     * session is the system-sounds pseudo-session, S_FALSE (1) otherwise.
+     */
+    fun isSystemSounds(): Boolean {
+        val hr = _invokeNativeInt(15, arrayOf(this.pointer))
+        return hr == 0
+    }
 }
 
 // ISimpleAudioVolume vtable:

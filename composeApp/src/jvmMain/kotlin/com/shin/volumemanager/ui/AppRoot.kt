@@ -2,6 +2,7 @@ package com.shin.volumemanager.ui
 
 import androidx.compose.foundation.window.WindowDraggableArea
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -14,6 +15,8 @@ import androidx.compose.ui.window.rememberWindowState
 import com.shin.volumemanager.state.VolumeManagerIntent
 import com.shin.volumemanager.state.VolumeManagerViewModel
 import com.shin.volumemanager.ui.snap.WindowSnap
+import java.awt.event.WindowFocusListener
+import java.awt.event.WindowEvent
 
 /**
  * Top-level UI host. Owns the main icon column [Window] and, inside it, the
@@ -59,6 +62,22 @@ fun ApplicationScope.AppRoot(
                 viewModel.handle(VolumeManagerIntent.SetPanelOnLeft(it))
             },
         )
+
+        // Close the side panel as soon as focus leaves the main window.
+        // The panel dialog is explicitly non-focusable (AWT
+        // focusableWindowState = false) so clicking it does NOT cause the
+        // main window to lose focus — which means a real focus-lost event
+        // means the user clicked elsewhere, and the panel should go away.
+        DisposableEffect(Unit) {
+            val listener = object : WindowFocusListener {
+                override fun windowGainedFocus(e: WindowEvent?) = Unit
+                override fun windowLostFocus(e: WindowEvent?) {
+                    viewModel.handle(VolumeManagerIntent.SelectPanel(null))
+                }
+            }
+            window.addWindowFocusListener(listener)
+            onDispose { window.removeWindowFocusListener(listener) }
+        }
 
         WindowDraggableArea {
             IconColumnContent(
