@@ -27,7 +27,6 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.FrameWindowScope
 import androidx.compose.ui.window.WindowPosition
 import androidx.compose.ui.window.WindowState
-import com.shin.volumemanager.model.AudioSession
 import com.shin.volumemanager.model.PanelContent
 import com.shin.volumemanager.state.VolumeManagerIntent
 import com.shin.volumemanager.state.VolumeManagerState
@@ -65,10 +64,21 @@ fun FrameWindowScope.PanelHost(
     val density = LocalDensity.current
     val parentWindow = window
 
-    // Compute initial position ONCE on mount so the dialog appears at the
-    // correct spot on its first frame instead of flashing at PlatformDefault.
-    val initialPosition = remember {
-        computePanelPosition(mainPos, state.panelOnLeft, pc, state.sessions)
+    // Compute initial position ONCE on mount using AWT coordinates so the
+    // dialog appears at the correct spot on its first frame.
+    val initialPanelBounds = remember {
+        val mainX = parentWindow.x
+        val mainY = parentWindow.y
+        val mainW = parentWindow.width
+        val panelWPx = (PANEL_W.value * density.density).toInt()
+        val gapPx = (PANEL_GAP.value * density.density).toInt()
+        val idx = if (pc is PanelContent.VolumeSession)
+            state.sessions.indexOfFirst { it.pid == pc.pid } else -1
+        val pyOffset = (panelYForIndex(pc, idx).value * density.density).toInt()
+        val sx = if (state.panelOnLeft) mainX - panelWPx - gapPx
+                 else mainX + mainW + gapPx
+        val sy = mainY + pyOffset
+        java.awt.Rectangle(sx, sy, panelWPx, (PANEL_H.value * density.density).toInt())
     }
 
     // Drives the entry animation. Flipping `visible` to true on the next
@@ -119,11 +129,7 @@ fun FrameWindowScope.PanelHost(
                 // Position and size the JDialog directly so the first frame
                 // appears in the right place — Compose's WindowState would
                 // have to wait for an UpdateEffect cycle.
-                val px = (initialPosition.x.value * density.density).toInt()
-                val py = (initialPosition.y.value * density.density).toInt()
-                val pw = (PANEL_W.value * density.density).toInt()
-                val ph = (PANEL_H.value * density.density).toInt()
-                setBounds(px, py, pw, ph)
+                setBounds(initialPanelBounds)
 
                 setContent {
                     val inputs = contentHolder.value
@@ -165,25 +171,21 @@ fun FrameWindowScope.PanelHost(
                 dialog.isAlwaysOnTop = parentWindow.isAlwaysOnTop
             }
 
-            // Reposition the dialog every recomposition so that switching
-            // to a different session icon (pc change), dragging the main
-            // window (mainWindowState.position change), or flipping sides
-            // (panelOnLeft change) all move the panel to the new anchor.
-            // PanelHost recomposes on any of those, so update() fires here
-            // and we re-derive the absolute screen coords from the latest
-            // pc/state. Doing this in update — instead of a snapshotFlow
-            // keyed on pc — guarantees we don't miss the first frame after
-            // pc changes.
-            val absPos = mainWindowState.position as? WindowPosition.Absolute
-                ?: return@AwtWindow
+            // Reposition using the AWT window's actual pixel coordinates
+            // to avoid dp↔pixel conversion issues on macOS Retina.
+            val mainX = parentWindow.x
+            val mainY = parentWindow.y
+            val mainW = parentWindow.width
+            val panelWPx = (PANEL_W.value * density.density).toInt()
+            val gapPx = (PANEL_GAP.value * density.density).toInt()
+
             val idx = if (pc is PanelContent.VolumeSession)
                 state.sessions.indexOfFirst { it.pid == pc.pid } else -1
-            val py = panelYForIndex(pc, idx)
-            val pxDp = if (state.panelOnLeft) absPos.x - PANEL_W - PANEL_GAP
-                       else                    absPos.x + COLLAPSED_W + PANEL_GAP
-            val pyDp = absPos.y + py
-            val sx = (pxDp.value * density.density).toInt()
-            val sy = (pyDp.value * density.density).toInt()
+            val pyOffset = (panelYForIndex(pc, idx).value * density.density).toInt()
+
+            val sx = if (state.panelOnLeft) mainX - panelWPx - gapPx
+                     else                   mainX + mainW + gapPx
+            val sy = mainY + pyOffset
             if (dialog.x != sx || dialog.y != sy) {
                 dialog.setLocation(sx, sy)
             }
@@ -218,21 +220,6 @@ private fun PanelBody(
             onOpacityChange = { onIntent(VolumeManagerIntent.SetOpacity(it)) },
         )
     }
-}
-
-/** Where the panel dialog should sit on screen, in dp. */
-private fun computePanelPosition(
-    mainPos: WindowPosition.Absolute,
-    panelOnLeft: Boolean,
-    content: PanelContent,
-    sessions: List<AudioSession>,
-): WindowPosition.Absolute {
-    val idx = if (content is PanelContent.VolumeSession)
-        sessions.indexOfFirst { it.pid == content.pid } else -1
-    val py = panelYForIndex(content, idx)
-    val px = if (panelOnLeft) mainPos.x - PANEL_W - PANEL_GAP
-             else             mainPos.x + COLLAPSED_W + PANEL_GAP
-    return WindowPosition.Absolute(px, mainPos.y + py)
 }
 
 /** Y offset within the icon column window for the row matching [content]. */

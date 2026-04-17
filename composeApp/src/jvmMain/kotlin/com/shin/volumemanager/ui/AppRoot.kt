@@ -15,8 +15,8 @@ import androidx.compose.ui.window.rememberWindowState
 import com.shin.volumemanager.state.VolumeManagerIntent
 import com.shin.volumemanager.state.VolumeManagerViewModel
 import com.shin.volumemanager.ui.snap.WindowSnap
-import java.awt.event.WindowFocusListener
 import java.awt.event.WindowEvent
+import java.awt.event.WindowFocusListener
 
 /**
  * Top-level UI host. Owns the main icon column [Window] and, inside it, the

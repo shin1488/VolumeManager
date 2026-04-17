@@ -12,6 +12,9 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.toComposeImageBitmap
+import org.jetbrains.skia.Image
 import java.io.BufferedReader
 import java.io.InputStreamReader
 import java.io.PrintWriter
@@ -46,6 +49,9 @@ class MacAudioSessionService : AudioSessionService {
     private var pollerJob: Job? = null
     private var helperProcess: Process? = null
     private var helperWriter: PrintWriter? = null
+
+    // Cache decoded icons by pid so we don't re-decode base64 every poll.
+    private val iconCache = mutableMapOf<Int, ImageBitmap?>()
 
     init {
         startHelper()
@@ -148,11 +154,16 @@ class MacAudioSessionService : AudioSessionService {
             val name = extractString(obj, "name") ?: "pid:$pid"
             val volume = extractDouble(obj, "volume") ?: 1.0
             val muted = extractBool(obj, "muted") ?: false
+            val iconB64 = extractString(obj, "icon")
+
+            val icon = if (iconB64 != null) {
+                iconCache.getOrPut(pid) { decodeIcon(iconB64) }
+            } else null
 
             AudioSession(
                 pid = pid,
                 displayName = name,
-                icon = null,
+                icon = icon,
                 volume = volume.toFloat(),
                 isMuted = muted,
             )
@@ -201,6 +212,15 @@ class MacAudioSessionService : AudioSessionService {
         val pattern = "\"$key\"\\s*:\\s*(true|false)"
         val match = Regex(pattern).find(json) ?: return null
         return match.groupValues[1] == "true"
+    }
+
+    private fun decodeIcon(base64: String): ImageBitmap? {
+        return try {
+            val bytes = java.util.Base64.getDecoder().decode(base64)
+            Image.makeFromEncoded(bytes).toComposeImageBitmap()
+        } catch (_: Exception) {
+            null
+        }
     }
 
     private fun locateHelperBinary(): String? {
