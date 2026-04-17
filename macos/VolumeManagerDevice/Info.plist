@@ -42,8 +42,7 @@
 
   <key>CFPlugInFactories</key>
   <dict>
-    <!-- TODO(macos): generate a real UUID and mirror it in the .cpp file. -->
-    <key>00000000-0000-0000-0000-0000DEADBEEF</key>
+    <key>5B7F2C8A-4E91-4D3A-B5F7-8A2E9C1F6D43</key>
     <string>VolumeManagerPlugIn_Create</string>
   </dict>
 
@@ -52,7 +51,7 @@
     <!-- AudioServerPlugIn type UUID. Do not change. -->
     <key>443ABAB8-E7B3-491A-B985-BEB9187030DB</key>
     <array>
-      <string>00000000-0000-0000-0000-0000DEADBEEF</string>
+      <string>5B7F2C8A-4E91-4D3A-B5F7-8A2E9C1F6D43</string>
     </array>
   </dict>
 </dict>

@@ -1,21 +1,24 @@
 // VolumeManagerHelper / main.swift
 //
-// Bridges the Kotlin/Compose UI to the VolumeManagerDevice Audio Server
-// Plug-in. The UI speaks JSON-over-stdio (or an XPC listener, TBD) to
-// this helper; the helper uses CoreAudio to enumerate clients of the
-// virtual device and read/write their per-client volume + mute properties.
+// Audio forwarder: captures from VolumeManagerDevice's loopback input
+// stream using one AUHAL AudioUnit and plays through the real default
+// output device using another AUHAL AudioUnit. A render callback on
+// the playback unit pulls samples from a ring buffer that the capture
+// unit's input callback fills.
 //
-// This file is intentionally a stub. The shape of the protocol is fixed
-// (see `Command` / `Event`) so the Kotlin side can start consuming it
-// before the CoreAudio plumbing lands.
+// Also hosts the JSON-over-stdio control bridge for the Kotlin UI
+// (per-app volume stubs).
 
-import Foundation
+import AppKit      // NSRunningApplication
+import AudioToolbox
 import CoreAudio
+import Darwin      // proc_name
+import Foundation
 
 // MARK: - Wire format ---------------------------------------------------------
 
 struct Command: Codable {
-    let op: String          // "list" | "setVolume" | "setMute" | "subscribe"
+    let op: String
     let pid: Int32?
     let value: Double?
 }
@@ -28,25 +31,302 @@ struct Session: Codable {
 }
 
 struct Event: Codable {
-    let type: String        // "sessions" | "error"
+    let type: String
     let sessions: [Session]?
     let message: String?
 }
 
-// MARK: - CoreAudio glue (TODO) -----------------------------------------------
+// MARK: - CoreAudio helpers ---------------------------------------------------
 
-enum DeviceAccess {
-    /// TODO(macos): discover the VolumeManagerDevice by UID, query its
-    /// custom `kAudioDevicePropertyClients`-equivalent property, and map
-    /// the result into `[Session]`.
-    static func snapshot() -> [Session] { [] }
+let kVolumeManagerDeviceUID = "VolumeManagerDevice_UID"
 
-    /// TODO(macos): call `AudioObjectSetPropertyData` with the scalar
-    /// volume for the per-client volume control owned by `pid`.
-    static func setVolume(pid: Int32, value: Double) {}
+enum HAL {
+    static func device(byUID uid: String) -> AudioDeviceID? {
+        var deviceID = AudioDeviceID(kAudioObjectUnknown)
+        var cfUID: CFString = uid as CFString
 
-    /// TODO(macos): same as above but for the boolean mute control.
-    static func setMute(pid: Int32, muted: Bool) {}
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDeviceForUID,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
+        var size = UInt32(MemoryLayout<AudioValueTranslation>.size)
+
+        let err = withUnsafeMutablePointer(to: &cfUID) { uidPtr in
+            withUnsafeMutablePointer(to: &deviceID) { devPtr in
+                var translation = AudioValueTranslation(
+                    mInputData: uidPtr,
+                    mInputDataSize: UInt32(MemoryLayout<CFString>.size),
+                    mOutputData: devPtr,
+                    mOutputDataSize: UInt32(MemoryLayout<AudioDeviceID>.size))
+                return withUnsafeMutablePointer(to: &translation) { tPtr -> OSStatus in
+                    AudioObjectGetPropertyData(
+                        AudioObjectID(kAudioObjectSystemObject),
+                        &address, 0, nil, &size, tPtr)
+                }
+            }
+        }
+        guard err == noErr, deviceID != kAudioObjectUnknown else { return nil }
+        return deviceID
+    }
+
+    static func defaultOutputDevice() -> AudioDeviceID {
+        var id = AudioDeviceID(kAudioObjectUnknown)
+        var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
+        AudioObjectGetPropertyData(
+            AudioObjectID(kAudioObjectSystemObject),
+            &address, 0, nil, &size, &id)
+        return id
+    }
+
+    static func deviceSampleRate(_ dev: AudioDeviceID) -> Float64 {
+        var rate: Float64 = 48000
+        var size = UInt32(MemoryLayout<Float64>.size)
+        var addr = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyNominalSampleRate,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
+        AudioObjectGetPropertyData(dev, &addr, 0, nil, &size, &rate)
+        return rate
+    }
+}
+
+// MARK: - TPCircularBuffer-style ring buffer ----------------------------------
+
+/// Simple SPSC ring buffer for Float32 samples. Uses monotonic
+/// 64-bit counters (no wrap — overflow in ~3 million years at 48kHz).
+final class RingBuffer {
+    private let buf: UnsafeMutablePointer<Float>
+    private let cap: Int
+    private var w: Int = 0   // monotonic write position (in floats)
+    private var r: Int = 0   // monotonic read position (in floats)
+
+    init(floatCapacity: Int) {
+        cap = floatCapacity
+        buf = .allocate(capacity: floatCapacity)
+        buf.initialize(repeating: 0, count: floatCapacity)
+    }
+    deinit { buf.deallocate() }
+
+    var available: Int { w - r }
+
+    func write(_ src: UnsafePointer<Float>, count: Int) {
+        for i in 0..<count {
+            buf[(w + i) % cap] = src[i]
+        }
+        w += count
+    }
+
+    func read(into dst: UnsafeMutablePointer<Float>, count: Int) {
+        // If writer is way ahead, skip forward to stay close.
+        if available > cap { r = w - cap / 2 }
+        for i in 0..<count {
+            if r + i < w {
+                dst[i] = buf[(r + i) % cap]
+            } else {
+                dst[i] = 0  // underrun → silence
+            }
+        }
+        r += count
+    }
+}
+
+// MARK: - AUHAL forwarder -----------------------------------------------------
+
+func log(_ msg: String) {
+    FileHandle.standardError.write(
+        Data("VolumeManagerHelper: \(msg)\n".utf8))
+}
+
+final class AudioForwarder {
+    // Ring buffer: 2ch * 48000 * 2s = 192000 floats
+    private let ring = RingBuffer(floatCapacity: 192_000)
+    private var captureUnit:  AudioComponentInstance?
+    private var playbackUnit: AudioComponentInstance?
+    private var running = false
+
+    func start() {
+        guard !running else { return }
+
+        guard let captureDevID = HAL.device(byUID: kVolumeManagerDeviceUID) else {
+            log("capture device not found"); return
+        }
+        let playbackDevID = HAL.defaultOutputDevice()
+        guard playbackDevID != captureDevID,
+              playbackDevID != kAudioObjectUnknown else {
+            log("default output unusable"); return
+        }
+
+        let capRate = HAL.deviceSampleRate(captureDevID)
+        let outRate = HAL.deviceSampleRate(playbackDevID)
+        log("capture device=\(captureDevID) rate=\(capRate)")
+        log("playback device=\(playbackDevID) rate=\(outRate)")
+
+        // Common ASBD: 2ch interleaved Float32 at capture device rate.
+        var asbd = AudioStreamBasicDescription(
+            mSampleRate: capRate,
+            mFormatID: kAudioFormatLinearPCM,
+            mFormatFlags: kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked | kAudioFormatFlagsNativeEndian,
+            mBytesPerPacket: 8,
+            mFramesPerPacket: 1,
+            mBytesPerFrame: 8,
+            mChannelsPerFrame: 2,
+            mBitsPerChannel: 32,
+            mReserved: 0)
+
+        // ---- Create capture AUHAL (input-only) ----
+        var desc = AudioComponentDescription(
+            componentType: kAudioUnitType_Output,
+            componentSubType: kAudioUnitSubType_HALOutput,
+            componentManufacturer: kAudioUnitManufacturer_Apple,
+            componentFlags: 0, componentFlagsMask: 0)
+
+        guard let comp = AudioComponentFindNext(nil, &desc) else {
+            log("AUHAL component not found"); return
+        }
+
+        var capUnit: AudioComponentInstance?
+        AudioComponentInstanceNew(comp, &capUnit)
+        guard let capUnit = capUnit else { log("capture unit alloc failed"); return }
+
+        // Enable input, disable output on capture unit.
+        var one: UInt32 = 1
+        var zero: UInt32 = 0
+        AudioUnitSetProperty(capUnit, kAudioOutputUnitProperty_EnableIO,
+                             kAudioUnitScope_Input, 1, &one, 4)
+        AudioUnitSetProperty(capUnit, kAudioOutputUnitProperty_EnableIO,
+                             kAudioUnitScope_Output, 0, &zero, 4)
+
+        // Set capture device.
+        var capDev = captureDevID
+        AudioUnitSetProperty(capUnit, kAudioOutputUnitProperty_CurrentDevice,
+                             kAudioUnitScope_Global, 0,
+                             &capDev, UInt32(MemoryLayout<AudioDeviceID>.size))
+
+        // Set format we want on the output side of the capture unit
+        // (i.e., what we receive in the callback).
+        AudioUnitSetProperty(capUnit, kAudioUnitProperty_StreamFormat,
+                             kAudioUnitScope_Output, 1,
+                             &asbd, UInt32(MemoryLayout<AudioStreamBasicDescription>.size))
+
+        // Input callback: capture → ring buffer.
+        let ringPtr = Unmanaged.passUnretained(ring).toOpaque()
+        var inputCB = AURenderCallbackStruct(
+            inputProc: { (inRefCon, ioFlags, inTimeStamp, inBusNumber, inFrames, _) -> OSStatus in
+                let ring = Unmanaged<RingBuffer>.fromOpaque(inRefCon).takeUnretainedValue()
+
+                // We need to pull audio from the capture unit. To do that
+                // we call AudioUnitRender. But we need the capture unit
+                // reference... we'll store it in a global. Not pretty but
+                // this is a single-instance helper.
+                guard let unit = AudioForwarder.sharedCaptureUnit else { return noErr }
+
+                var bufList = AudioBufferList(
+                    mNumberBuffers: 1,
+                    mBuffers: AudioBuffer(
+                        mNumberChannels: 2,
+                        mDataByteSize: inFrames * 8,
+                        mData: nil))
+
+                // Allocate temp buffer.
+                let tmp = UnsafeMutablePointer<Float>.allocate(capacity: Int(inFrames) * 2)
+                defer { tmp.deallocate() }
+                bufList.mBuffers.mData = UnsafeMutableRawPointer(tmp)
+
+                let status = AudioUnitRender(unit, ioFlags, inTimeStamp, inBusNumber, inFrames, &bufList)
+                if status == noErr {
+                    ring.write(tmp, count: Int(inFrames) * 2)
+                }
+                return noErr
+            },
+            inputProcRefCon: ringPtr)
+        AudioUnitSetProperty(capUnit, kAudioOutputUnitProperty_SetInputCallback,
+                             kAudioUnitScope_Global, 0,
+                             &inputCB, UInt32(MemoryLayout<AURenderCallbackStruct>.size))
+
+        AudioForwarder.sharedCaptureUnit = capUnit
+        captureUnit = capUnit
+
+        // ---- Create playback AUHAL (output-only, default) ----
+        var outUnit: AudioComponentInstance?
+        AudioComponentInstanceNew(comp, &outUnit)
+        guard let outUnit = outUnit else { log("playback unit alloc failed"); return }
+
+        // Set playback device.
+        var outDev = playbackDevID
+        AudioUnitSetProperty(outUnit, kAudioOutputUnitProperty_CurrentDevice,
+                             kAudioUnitScope_Global, 0,
+                             &outDev, UInt32(MemoryLayout<AudioDeviceID>.size))
+
+        // Set format on the input side of the playback unit.
+        // Use capRate (not outRate!) because our ring buffer data
+        // comes from the capture unit at capRate. The AUHAL will
+        // internally sample-rate-convert capRate → outRate.
+        var outAsbd = asbd  // already at capRate
+        AudioUnitSetProperty(outUnit, kAudioUnitProperty_StreamFormat,
+                             kAudioUnitScope_Input, 0,
+                             &outAsbd, UInt32(MemoryLayout<AudioStreamBasicDescription>.size))
+
+        // Render callback: ring buffer → playback.
+        var renderCB = AURenderCallbackStruct(
+            inputProc: { (inRefCon, _, _, _, inFrames, ioData) -> OSStatus in
+                let ring = Unmanaged<RingBuffer>.fromOpaque(inRefCon).takeUnretainedValue()
+                guard let ioData = ioData else { return noErr }
+                let buffers = UnsafeMutableAudioBufferListPointer(ioData)
+                if buffers.count == 1 && buffers[0].mNumberChannels >= 2 {
+                    // Interleaved
+                    if let data = buffers[0].mData {
+                        ring.read(into: data.assumingMemoryBound(to: Float.self),
+                                  count: Int(inFrames) * 2)
+                    }
+                } else if buffers.count >= 2 {
+                    // Non-interleaved: deinterleave from ring
+                    let tmp = UnsafeMutablePointer<Float>.allocate(capacity: Int(inFrames) * 2)
+                    defer { tmp.deallocate() }
+                    ring.read(into: tmp, count: Int(inFrames) * 2)
+                    for c in 0..<min(2, buffers.count) {
+                        if let dst = buffers[c].mData?.assumingMemoryBound(to: Float.self) {
+                            for i in 0..<Int(inFrames) {
+                                dst[i] = tmp[i * 2 + c]
+                            }
+                        }
+                    }
+                }
+                return noErr
+            },
+            inputProcRefCon: ringPtr)
+        AudioUnitSetProperty(outUnit, kAudioUnitProperty_SetRenderCallback,
+                             kAudioUnitScope_Input, 0,
+                             &renderCB, UInt32(MemoryLayout<AURenderCallbackStruct>.size))
+
+        playbackUnit = outUnit
+
+        // ---- Initialize and start both units ----
+        var err = AudioUnitInitialize(capUnit)
+        if err != noErr { log("capture init failed: \(err)"); return }
+        err = AudioUnitInitialize(outUnit)
+        if err != noErr { log("playback init failed: \(err)"); return }
+
+        err = AudioOutputUnitStart(capUnit)
+        if err != noErr { log("capture start failed: \(err)"); return }
+        err = AudioOutputUnitStart(outUnit)
+        if err != noErr { log("playback start failed: \(err)"); return }
+
+        running = true
+        log("forwarder running OK")
+    }
+
+    func stop() {
+        if let u = captureUnit  { AudioOutputUnitStop(u); AudioComponentInstanceDispose(u) }
+        if let u = playbackUnit { AudioOutputUnitStop(u); AudioComponentInstanceDispose(u) }
+        running = false
+    }
+
+    // Shared reference so the input callback can call AudioUnitRender.
+    static var sharedCaptureUnit: AudioComponentInstance?
 }
 
 // MARK: - Event loop ----------------------------------------------------------
@@ -60,6 +340,104 @@ func emit(_ event: Event) {
     FileHandle.standardOutput.write(Data((line + "\n").utf8))
 }
 
+// MARK: - Driver custom property bridge ---------------------------------------
+
+// Must match the FourCC selectors in VolumeManagerPlugIn.cpp.
+let kVMProp_ClientList: AudioObjectPropertySelector = 0x564D636C  // 'VMcl'
+let kVMProp_SetVolume:  AudioObjectPropertySelector = 0x564D7376  // 'VMsv'
+let kVMProp_SetMute:    AudioObjectPropertySelector = 0x564D736D  // 'VMsm'
+
+// Matches the C struct VMClientInfo in the driver.
+struct VMClientInfo {
+    var pid:      Int32
+    var clientID: UInt32
+    var volume:   Float32
+    var muted:    UInt32
+}
+
+enum DriverBridge {
+    /// Read the current client list from the driver via kVMProp_ClientList.
+    static func listClients(deviceID: AudioDeviceID) -> [Session] {
+        var addr = AudioObjectPropertyAddress(
+            mSelector: kVMProp_ClientList,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
+
+        // First query size.
+        var size: UInt32 = 0
+        var err = AudioObjectGetPropertyDataSize(deviceID, &addr, 0, nil, &size)
+        guard err == noErr, size > 0 else { return [] }
+
+        let count = Int(size) / MemoryLayout<VMClientInfo>.size
+        var buf = [VMClientInfo](repeating: VMClientInfo(pid: 0, clientID: 0, volume: 1, muted: 0),
+                                 count: count)
+        err = buf.withUnsafeMutableBytes { ptr -> OSStatus in
+            var sz = size
+            return AudioObjectGetPropertyData(deviceID, &addr, 0, nil, &sz, ptr.baseAddress!)
+        }
+        guard err == noErr else { return [] }
+
+        return buf.map { info in
+            // Try to get the process name.
+            let name = ProcessInfo.processInfo.processName  // fallback
+            let actualName = DriverBridge.processName(pid: info.pid) ?? "pid:\(info.pid)"
+            return Session(pid: info.pid, name: actualName,
+                           volume: Double(info.volume), muted: info.muted != 0)
+        }
+    }
+
+    /// Set per-app volume via kVMProp_SetVolume.
+    static func setVolume(deviceID: AudioDeviceID, pid: Int32, volume: Float) {
+        var addr = AudioObjectPropertyAddress(
+            mSelector: kVMProp_SetVolume,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
+        // Payload: { pid_t, Float32 }
+        var payload = (pid, volume)
+        let size = UInt32(MemoryLayout.size(ofValue: payload))
+        withUnsafePointer(to: &payload) { ptr in
+            AudioObjectSetPropertyData(deviceID, &addr, 0, nil, size,
+                                       UnsafeRawPointer(ptr))
+        }
+    }
+
+    /// Set per-app mute via kVMProp_SetMute.
+    static func setMute(deviceID: AudioDeviceID, pid: Int32, muted: Bool) {
+        var addr = AudioObjectPropertyAddress(
+            mSelector: kVMProp_SetMute,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
+        var payload: (Int32, UInt32) = (pid, muted ? 1 : 0)
+        let size = UInt32(MemoryLayout.size(ofValue: payload))
+        withUnsafePointer(to: &payload) { ptr in
+            AudioObjectSetPropertyData(deviceID, &addr, 0, nil, size,
+                                       UnsafeRawPointer(ptr))
+        }
+    }
+
+    /// Get process name from pid via NSRunningApplication or proc_name.
+    static func processName(pid: Int32) -> String? {
+        // Try NSWorkspace first (more readable names).
+        if let app = NSRunningApplication(processIdentifier: pid) {
+            return app.localizedName
+        }
+        // Fallback: proc_name via C.
+        var name = [CChar](repeating: 0, count: 256)
+        proc_name(pid, &name, 256)
+        let s = String(cString: name)
+        return s.isEmpty ? nil : s
+    }
+}
+
+// MARK: - Main ----------------------------------------------------------------
+
+let forwarder = AudioForwarder()
+forwarder.start()
+emit(Event(type: "status", sessions: nil, message: "forwarder started"))
+
+// Resolve device ID once for property queries.
+let vmDeviceID = HAL.device(byUID: kVolumeManagerDeviceUID) ?? AudioDeviceID(kAudioObjectUnknown)
+
 while let line = readLine() {
     guard let data = line.data(using: .utf8),
           let cmd  = try? decoder.decode(Command.self, from: data) else {
@@ -69,25 +447,27 @@ while let line = readLine() {
 
     switch cmd.op {
     case "list":
-        emit(Event(type: "sessions", sessions: DeviceAccess.snapshot(), message: nil))
+        let sessions = DriverBridge.listClients(deviceID: vmDeviceID)
+        emit(Event(type: "sessions", sessions: sessions, message: nil))
 
     case "setVolume":
         if let pid = cmd.pid, let v = cmd.value {
-            DeviceAccess.setVolume(pid: pid, value: v)
+            DriverBridge.setVolume(deviceID: vmDeviceID, pid: pid, volume: Float(v))
         }
 
     case "setMute":
         if let pid = cmd.pid, let v = cmd.value {
-            DeviceAccess.setMute(pid: pid, muted: v != 0)
+            DriverBridge.setMute(deviceID: vmDeviceID, pid: pid, muted: v != 0)
         }
 
     case "subscribe":
-        // TODO(macos): register an AudioObjectPropertyListener that emits
-        //  "sessions" events whenever the client list or any client's
-        //  volume/mute changes.
+        // TODO: register AudioObjectPropertyListener on kVMProp_ClientList
+        // and emit sessions events on change.
         break
 
     default:
         emit(Event(type: "error", sessions: nil, message: "unknown op: \(cmd.op)"))
     }
 }
+
+forwarder.stop()

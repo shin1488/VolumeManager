@@ -112,8 +112,6 @@ class MacAudioSessionService : AudioSessionService {
     }
 
     private fun handleEvent(line: String) {
-        // Lightweight JSON parsing — avoids adding kotlinx.serialization dep.
-        // The helper emits single-line JSON; format is fixed and simple.
         val type = extractString(line, "type") ?: return
 
         when (type) {
@@ -132,12 +130,7 @@ class MacAudioSessionService : AudioSessionService {
         }
     }
 
-    /**
-     * Parses the `"sessions":[...]` array from the helper's JSON output.
-     * Each element: `{"pid":N,"name":"...","volume":F,"muted":BOOL}`
-     */
     private fun parseSessionsArray(json: String): List<AudioSession> {
-        // Find the sessions array content between [ and ].
         val arrStart = json.indexOf("\"sessions\"")
         if (arrStart < 0) return emptyList()
         val bracketStart = json.indexOf('[', arrStart)
@@ -148,7 +141,6 @@ class MacAudioSessionService : AudioSessionService {
         val arrayContent = json.substring(bracketStart + 1, bracketEnd).trim()
         if (arrayContent.isEmpty()) return emptyList()
 
-        // Split by top-level `},{` — works because our values never contain `}`.
         val objects = splitJsonObjects(arrayContent)
 
         return objects.mapNotNull { obj ->
@@ -167,7 +159,6 @@ class MacAudioSessionService : AudioSessionService {
         }
     }
 
-    /** Splits `{...},{...}` into individual object strings. */
     private fun splitJsonObjects(content: String): List<String> {
         val results = mutableListOf<String>()
         var depth = 0
@@ -179,7 +170,6 @@ class MacAudioSessionService : AudioSessionService {
                     depth--
                     if (depth == 0) {
                         results.add(content.substring(start, i + 1))
-                        // Skip comma + whitespace.
                         start = i + 1
                         while (start < content.length && content[start] in listOf(',', ' ', '\t', '\n')) start++
                     }
@@ -214,18 +204,15 @@ class MacAudioSessionService : AudioSessionService {
     }
 
     private fun locateHelperBinary(): String? {
-        // 1. Environment override for development.
         System.getenv("VOLUMEMANAGER_HELPER")?.let { path ->
             if (java.io.File(path).canExecute()) return path
         }
 
         val home = System.getProperty("user.home") ?: return null
 
-        // 2. Installed location.
         val installed = java.io.File("$home/.volumemanager/VolumeManagerHelper")
         if (installed.canExecute()) return installed.absolutePath
 
-        // 3. Common Swift Package Manager build output.
         val devPaths = listOf(
             "$home/IdeaProjects/VM_Mac/VolumeManagerHelper/.build/debug/VolumeManagerHelper",
             "$home/IdeaProjects/VM_Mac/VolumeManagerHelper/.build/release/VolumeManagerHelper",
@@ -261,10 +248,6 @@ class MacAudioSessionService : AudioSessionService {
     }
 }
 
-/**
- * Fallback used when the app is launched on a platform we do not support
- * (e.g. Linux during development). Produces no sessions and ignores writes.
- */
 class NoopAudioSessionService : AudioSessionService {
     private val _sessions = MutableStateFlow<List<AudioSession>>(emptyList())
     override val sessions: StateFlow<List<AudioSession>> = _sessions.asStateFlow()
